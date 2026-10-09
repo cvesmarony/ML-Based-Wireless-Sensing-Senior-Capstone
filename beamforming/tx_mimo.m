@@ -39,6 +39,7 @@ end
 
 % QPSK Modulate
 qpskMod = comm.QPSKModulator('BitInput',true, 'PhaseOffset', pi/4);
+% likely need 2 separate qpsk modulating functions for different phases
 
 sounding_syms_S1 = qpskMod(sounding_bits_S1);
 sounding_syms_S2 = qpskMod(sounding_bits_S2);
@@ -79,6 +80,8 @@ disp("Alternating between MIMO Streams Continuously... Press Ctrl+C to stop.");
 silence = complex(zeros(5000, 1));
 silence2 = complex(zeros(7560, 1));
 
+% change this to send waveforms simultaneously
+% probably don't need frames since constantly sending data
 tx_frame_S1 = [silence; waveform_S1; silence2];
 tx_frame_S2 = [silence2; silence; waveform_S2];
 
