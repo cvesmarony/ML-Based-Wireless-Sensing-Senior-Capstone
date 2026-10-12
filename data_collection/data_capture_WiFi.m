@@ -1,19 +1,18 @@
-clear;
-
+clear; %test
 %% Configuration
 sampleRate   = 20e6;
-CaptureTime  = 1;                       % 100 ms = 2,000,000 samples (lightweight, won't lag)
+CaptureTime  = 0.006;                     % 100 ms burst capture
 TotalSamples = round(sampleRate * CaptureTime);
+channel      = 6;
+centerFreq   = 2407e6 + 5e6 * channel;
 
-channel    = 6;
-centerFreq = 2407e6 + 5e6 * channel;
-
+%% Hardware / Capture Interface
 rxObj = comm.SDRuReceiver( ...
     'Platform',           'B210', ...
-    'SerialNum',          '34C78FD', ...
+    'SerialNum',          '34C78EF', ...
     'MasterClockRate',    20e6, ...
     'DecimationFactor',   1, ...
-    'SamplesPerFrame',    TotalSamples, ... % Pulls entire burst via step call
+    'SamplesPerFrame',    TotalSamples, ...
     'CenterFrequency',    centerFreq, ...
     'ChannelMapping',     1, ...
     'ReceiveAntennaPort', 'RX2', ...
@@ -22,45 +21,257 @@ rxObj = comm.SDRuReceiver( ...
 
 disp('Capturing 20 MHz Wi-Fi frame...');
 [rxBuffer, ~, overrun] = rxObj();
-
 release(rxObj);
 
-% Plot envelope
-t = (0:length(rxBuffer)-1) / sampleRate * 1e3;
-plot(t, abs(rxBuffer));
-grid on;
-title('20 MHz Wi-Fi Packet Bursts');
-xlabel('Time (ms)');
-ylabel('Envelope Amplitude');
+if overrun
+    warning('Buffer overrun detected. Some samples may be dropped.');
+end
 
 sig = rxBuffer(:, 1);
 
-% 1. Detect start of Wi-Fi Packet
-pktStart = wlanPacketDetect(sig, 'CBW20');
+%% 1. Continuous Packet Detection
+% In a 100 ms buffer, there are likely multiple packets.
+% Detect all packet candidates above threshold.
+threshold = 0.5;
+pktStarts = zeros(0, 1);
+scanStart = 1;
+while scanStart + 159 <= length(sig)
+    localPktStart = wlanPacketDetect( ...
+        sig(scanStart:end), 'CBW20', 0, threshold);
+    if isempty(localPktStart)
+        break;
+    end
 
-if ~empty(pktStart)
-    fprintf('Packet detected at sample index: %d\n', pktStart);
+    pktStart = scanStart + double(localPktStart) - 1;
+    pktStarts(end+1, 1) = pktStart;
 
-    % Extract the Non-HT Long Training Field (L-LTF)
-    % L-LTF starts 160 samples after the start of packet (after L-STF)
-    lltf_start = pktStart + 160;
-    lltf_samples = sig(lltf_start : lltf_start + 160 - 1);
+    % Move past the repeated short-training field so this packet is not
+    % detected again while leaving later packets in the burst searchable.
+    scanStart = max(scanStart + 1, pktStart + 160);
+end
 
-    % Demodulate LLTF and compute Channel Frequency Response (CSI)
-    lltf_demod = wlanLLTFDemodulate(lltf_samples, 'CBW20');
-    [chanEst, noiseVarEst] = wlanLLTFChannelEstimate(lltf_demod, 'CBW20');
+if isempty(pktStarts)
+    error('No Wi-Fi packets detected in capture buffer.');
+end
 
-    % chanEst is a 52x1 complex vector representing H[k] for each subcarrier!
-    figure;
-    subplot(2,1,1);
-    stem(-26:26, [abs(chanEst(1:26)); 0; abs(chanEst(27:52))]); % Subcarrier magnitudes
-    title('Wi-Fi Channel Magnitude (|H[k]|) per Subcarrier');
-    xlabel('Subcarrier Index'); ylabel('|H|'); grid on;
+fprintf('Detected %d packet candidates.\n', length(pktStarts));
 
-    subplot(2,1,2);
-    stem(-26:26, [angle(chanEst(1:26)); 0; angle(chanEst(27:52))]);
-    title('Wi-Fi Channel Phase (\angle H[k])');
-    xlabel('Subcarrier Index'); ylabel('Phase (rad)'); grid on;
+% Data containers for training features
+csiDataset   = []; % [N_packets x 52] complex
+powerDataset = []; % [N_packets x 1] dBm or linear power
+snrDataset   = []; % [N_packets x 1] estimated SNR
+packetPlotInfo = zeros(length(pktStarts), 6); % boundaries and detection candidate number
+plotPacketCount = 0;
+
+%% 2. Process Detected Packets
+for p = 1:length(pktStarts)
+    pktStart = pktStarts(p);
+    
+    % Leave room for fine timing to align the packet and for the legacy header.
+    if (pktStart + 320) > length(sig)
+        continue;
+    end
+    
+    % Extract preamble segment
+    preamble = sig(pktStart : min(pktStart + 400, length(sig)));
+    
+    % --- Coarse Frequency Offset Correction using L-STF ---
+    cfoCoarse = wlanCoarseCFOEstimate(preamble(1:160), 'CBW20');
+    preambleCorr = helperFrequencyOffset( ...
+        preamble, -cfoCoarse, sampleRate, pktStart);
+    
+    % --- Fine Symbol Timing / Synchronization ---
+    % The returned offset aligns the start of the packet (L-STF).
+    fineOffset = wlanSymbolTimingEstimate(preambleCorr, 'CBW20');
+    syncStart = pktStart + fineOffset;
+    
+    if syncStart < 1 || syncStart + 399 > length(sig)
+        continue;
+    end
+    
+    % L-LTF follows the 160-sample L-STF.
+    lltfStart = syncStart + 160;
+
+    % Extract corrected L-LTF (160 samples: 32 CP + 64 T1 + 64 T2)
+    lltf_raw = sig(lltfStart : lltfStart + 160 - 1);
+    
+    % --- Fine Frequency Offset Correction using L-LTF ---
+    cfoFine = wlanFineCFOEstimate(lltf_raw, 'CBW20');
+    lltf_corrected = helperFrequencyOffset( ...
+        lltf_raw, -(cfoCoarse + cfoFine), sampleRate, lltfStart);
+    
+    % --- Demodulate L-LTF and Estimate CSI ---
+    % Demodulation performs FFT and discards the cyclic prefix
+    lltf_demod = wlanLLTFDemodulate(lltf_corrected, 'CBW20');
+    chanEst = wlanLLTFChannelEstimate(lltf_demod, 'CBW20');
+    noiseVarEst = wlanLLTFNoiseEstimate(lltf_demod);
+
+    % Decode L-SIG to estimate the end of this legacy Wi-Fi packet.
+    lsigStart = syncStart + 320;
+    if lsigStart + 79 <= length(sig)
+        lsig = sig(lsigStart : lsigStart + 79);
+        lsigCorrected = helperFrequencyOffset( ...
+            lsig, -(cfoCoarse + cfoFine), sampleRate, lsigStart);
+        [lsigBits, lsigFail] = wlanLSIGRecover( ...
+            lsigCorrected, chanEst, noiseVarEst, 'CBW20');
+        if ~lsigFail
+            rateCode = sum(double(lsigBits(1:4)) .* (2.^(3:-1:0))');
+            psduLength = sum(double(lsigBits(6:17)) .* (2.^(0:11))');
+            rateCodes = [13 15 5 7 9 11 1 3];
+            dataBitsPerSymbol = [24 36 48 72 96 144 192 216];
+            rateIdx = find(rateCodes == rateCode, 1);
+            if ~isempty(rateIdx)
+                dataSymbols = ceil((16 + 8 * psduLength + 6) / ...
+                    dataBitsPerSymbol(rateIdx));
+
+                phyStart = syncStart;
+                dataStart = syncStart + 400;
+                packetEnd = phyStart + 400 + 80 * dataSymbols;
+                plotPacketCount = plotPacketCount + 1;
+                packetPlotInfo(plotPacketCount, :) = ...
+                    [phyStart, lltfStart, lsigStart, dataStart, packetEnd, p];
+            end
+        end
+    end
+    
+    % chanEst is a 52x1 complex vector: H[k]
+    % --- Extract Power / RSSI Metrics ---
+    % Total packet preamble power (instantaneous power profile)
+    pktPwrLinear = mean(abs(lltf_corrected).^2);
+    pktPwr_dB = 10 * log10(pktPwrLinear + eps);
+    
+    % Subcarrier-averaged channel power
+    csiPower_dB = 10 * log10(mean(abs(chanEst).^2) + eps);
+    snrEst_dB   = 10 * log10((mean(abs(chanEst).^2)) / (noiseVarEst + eps));
+    
+    % Store feature vector
+    csiDataset(end+1, :)   = chanEst.';      % 52 complex subcarrier responses
+    powerDataset(end+1, :) = [pktPwr_dB, csiPower_dB];
+    snrDataset(end+1, :)   = snrEst_dB;
+end
+packetPlotInfo = packetPlotInfo(1:plotPacketCount, :);
+
+%% Raw I/Q waveform with packet-field markers
+t = (0:length(sig)-1) / sampleRate;
+if ~isempty(packetPlotInfo)
+    firstPacketSamples = packetPlotInfo(1, 5) - packetPlotInfo(1, 1);
+    firstPacketDurationMs = firstPacketSamples / sampleRate * 1e3;
+    fprintf(['First decoded packet duration (legacy OFDM estimate): ' ...
+        '%.3f ms (%d samples), derived from L-SIG.\n'], ...
+        firstPacketDurationMs, firstPacketSamples);
+end
+
+figure('Color', 'w');
+plot(t * 1e3, abs(sig));
+title('Wi-Fi IQ Magnitude - Full Capture');
+xlabel('Time (ms)');
+ylabel('|IQ|');
+grid on;
+hold on;
+for p = 1:length(pktStarts)
+    if any(packetPlotInfo(:, 6) == p)
+        continue;
+    end
+    candidateTime = (pktStarts(p) - 1) / sampleRate * 1e3;
+    xline(candidateTime, ':', sprintf('Candidate %d (not decoded)', p));
+end
+for p = 1:size(packetPlotInfo, 1)
+    startTimeMs = (packetPlotInfo(p, 1) - 1) / sampleRate * 1e3;
+    endTimeMs = (packetPlotInfo(p, 5) - 1) / sampleRate * 1e3;
+    packetNumber = packetPlotInfo(p, 6);
+    xline(startTimeMs, '-', sprintf('Packet %d start', packetNumber), ...
+        'Color', [0 0.45 0.74]);
+    xline(endTimeMs, '-', sprintf('Packet %d end', packetNumber), ...
+        'Color', [0.85 0.1 0.1], ...
+        'LineWidth', 1.5);
+end
+
+if ~isempty(packetPlotInfo)
+    packetStart = max(1, packetPlotInfo(1, 1));
+    packetEndBoundary = packetPlotInfo(1, 5);
+    packetEnd = min(length(sig), packetEndBoundary - 1);
+    timeRange = packetStart:packetEnd;
+    packetStartTimeMs = (packetStart - 1) / sampleRate * 1e3;
+    packetEndTimeMs = (packetEndBoundary - 1) / sampleRate * 1e3;
+    captureEndTimeMs = length(sig) / sampleRate * 1e3;
+
+    figure('Color', 'w');
+    plot(t(timeRange) * 1e3, abs(sig(timeRange)));
+    title(sprintf('Wi-Fi IQ Magnitude - First Decoded Packet (%.3f ms)', ...
+        firstPacketDurationMs));
+    xlabel('Time (ms)');
+    ylabel('|IQ|');
+    grid on;
+    hold on;
+
+    fieldSamples = packetPlotInfo(1, 1:4);
+    fieldTimes = [(fieldSamples - 1) / sampleRate * 1e3, packetEndTimeMs];
+    labels = {'Packet start / L-STF', 'L-LTF start', 'L-SIG start', ...
+        'DATA start', 'Packet end'};
+    for k = 1:length(fieldTimes)
+        if k == 1 || k == length(fieldTimes)
+            xline(fieldTimes(k), '-', labels{k}, ...
+                'Color', [0.85 0.1 0.1], 'LineWidth', 1.5, ...
+                'LabelVerticalAlignment', 'middle');
+        else
+            xline(fieldTimes(k), '--', labels{k}, ...
+                'LabelVerticalAlignment', 'middle');
+        end
+    end
+    if packetEndTimeMs <= captureEndTimeMs
+        xlim([packetStartTimeMs packetEndTimeMs]);
+    else
+        xlim([packetStartTimeMs captureEndTimeMs]);
+        text(0.99, 0.95, 'Capture ends before estimated packet end', ...
+            'Units', 'normalized', 'HorizontalAlignment', 'right', ...
+            'Color', [0.85 0.1 0.1]);
+    end
+
+    headerEnd = min(length(sig), packetPlotInfo(1, 4) + 159);
+    headerRange = packetStart:headerEnd;
+    figure('Color', 'w');
+    plot(t(headerRange) * 1e3, abs(sig(headerRange)));
+    title('Wi-Fi IQ Magnitude - Preamble and Header Detail');
+    xlabel('Time (ms)');
+    ylabel('|IQ|');
+    grid on;
+    detailTimes = fieldTimes(1:4);
+    detailLabels = labels(1:4);
+    hold on;
+    for k = 1:length(detailTimes)
+        xline(detailTimes(k), '--', detailLabels{k}, ...
+            'LabelVerticalAlignment', 'middle');
+    end
 else
-    disp('No packet detected in this capture window.');
+    warning('Could not decode an L-SIG field; packet end markers are unavailable.');
+end
+
+%% 3. Visualization
+if ~isempty(csiDataset)
+    figure('Color', 'w');
+    
+    % Subcarrier Magnitude & Phase
+    subcarrierIdx = [-26:-1, 1:26];
+    sampleCSI = csiDataset(1, :);
+    
+    subplot(3,1,1);
+    stem(subcarrierIdx, abs(sampleCSI), 'filled', 'LineWidth', 1.2);
+    title('Wi-Fi Subcarrier Channel Magnitude (|H[k]|)');
+    xlabel('Subcarrier Index'); ylabel('|H|'); grid on;
+    
+    subplot(3,1,2);
+    plot(subcarrierIdx, unwrap(angle(sampleCSI)), '-o', 'LineWidth', 1.2);
+    title('Wi-Fi Subcarrier Phase (\angle H[k])');
+    xlabel('Subcarrier Index'); ylabel('Phase (rad)'); grid on;
+    
+    subplot(3,1,3);
+    histogram(powerDataset(:, 1), 20);
+    title('Received Packet Power Distribution (dB)');
+    xlabel('Power (dBFS)'); ylabel('Frame Count'); grid on;
+end
+
+%% Helper CFO correction function
+function out = helperFrequencyOffset(in, fOffset, fs, startSample)
+    t = (startSample - 1 + (0:length(in)-1).') / fs;
+    out = in .* exp(1j * 2 * pi * fOffset * t);
 end
