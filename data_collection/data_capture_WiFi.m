@@ -1,7 +1,7 @@
 clear; %test
 %% Configuration
 sampleRate   = 20e6;
-CaptureTime  = 0.006;                     % 100 ms burst capture
+CaptureTime  = 0.1;                       % 100 ms burst capture
 TotalSamples = round(sampleRate * CaptureTime);
 channel      = 6;
 centerFreq   = 2407e6 + 5e6 * channel;
@@ -9,7 +9,7 @@ centerFreq   = 2407e6 + 5e6 * channel;
 %% Hardware / Capture Interface
 rxObj = comm.SDRuReceiver( ...
     'Platform',           'B210', ...
-    'SerialNum',          '34C78EF', ...
+    'SerialNum',          '34C78EF', ... #will have to check this with "findsdru"
     'MasterClockRate',    20e6, ...
     'DecimationFactor',   1, ...
     'SamplesPerFrame',    TotalSamples, ...
@@ -62,6 +62,11 @@ powerDataset = []; % [N_packets x 1] dBm or linear power
 snrDataset   = []; % [N_packets x 1] estimated SNR
 packetPlotInfo = zeros(length(pktStarts), 6); % boundaries and detection candidate number
 plotPacketCount = 0;
+packetMacs = repmat({'MAC unavailable'}, length(pktStarts), 1);
+packetMacStatus = repmat({'L-SIG was not decoded'}, length(pktStarts), 1);
+featureCandidateIds = zeros(length(pktStarts), 1);
+featureRouterMacs = cell(length(pktStarts), 1);
+featureCount = 0;
 
 %% 2. Process Detected Packets
 for p = 1:length(pktStarts)
@@ -69,6 +74,7 @@ for p = 1:length(pktStarts)
     
     % Leave room for fine timing to align the packet and for the legacy header.
     if (pktStart + 320) > length(sig)
+        packetMacStatus{p} = 'capture ended before the L-SIG field';
         continue;
     end
     
@@ -86,6 +92,7 @@ for p = 1:length(pktStarts)
     syncStart = pktStart + fineOffset;
     
     if syncStart < 1 || syncStart + 399 > length(sig)
+        packetMacStatus{p} = 'capture ended before the synchronized packet header';
         continue;
     end
     
@@ -127,11 +134,41 @@ for p = 1:length(pktStarts)
                 phyStart = syncStart;
                 dataStart = syncStart + 400;
                 packetEnd = phyStart + 400 + 80 * dataSymbols;
+
+                % Recover the PSDU to read the MAC transmitter address.
+                % Address 2 is the transmitter address for management/data frames.
+                if psduLength < 10
+                    packetMacStatus{p} = 'L-SIG PSDU length is too short for a MAC header';
+                elseif packetEnd > length(sig)
+                    packetMacStatus{p} = sprintf( ...
+                        'capture ended before packet data (needs sample %d; capture has %d)', ...
+                        packetEnd - 1, length(sig));
+                else
+                    dataSamples = sig(dataStart:packetEnd-1);
+                    dataCorrected = helperFrequencyOffset( ...
+                        dataSamples, -(cfoCoarse + cfoFine), ...
+                        sampleRate, dataStart);
+                    nonHTConfig = wlanNonHTConfig( ...
+                        'ChannelBandwidth', 'CBW20', ...
+                        'MCS', rateIdx - 1, ...
+                        'PSDULength', psduLength);
+                    psduBits = wlanNonHTDataRecover( ...
+                        dataCorrected, chanEst, noiseVarEst, nonHTConfig);
+                    [packetMacs{p}, packetMacStatus{p}] = ...
+                        helperExtractTransmitterAddress(psduBits);
+                end
+
                 plotPacketCount = plotPacketCount + 1;
                 packetPlotInfo(plotPacketCount, :) = ...
                     [phyStart, lltfStart, lsigStart, dataStart, packetEnd, p];
+            else
+                packetMacStatus{p} = 'L-SIG contains an unsupported legacy data rate';
             end
+        else
+            packetMacStatus{p} = 'L-SIG decoding failed';
         end
+    else
+        packetMacStatus{p} = 'capture ended before the L-SIG field';
     end
     
     % chanEst is a 52x1 complex vector: H[k]
@@ -148,8 +185,24 @@ for p = 1:length(pktStarts)
     csiDataset(end+1, :)   = chanEst.';      % 52 complex subcarrier responses
     powerDataset(end+1, :) = [pktPwr_dB, csiPower_dB];
     snrDataset(end+1, :)   = snrEst_dB;
+    featureCount = featureCount + 1;
+    featureCandidateIds(featureCount) = p;
+    featureRouterMacs{featureCount} = packetMacs{p};
 end
 packetPlotInfo = packetPlotInfo(1:plotPacketCount, :);
+featureCandidateIds = featureCandidateIds(1:featureCount);
+featureRouterMacs = featureRouterMacs(1:featureCount);
+
+for candidateId = 1:length(pktStarts)
+    if strcmp(packetMacs{candidateId}, 'MAC unavailable')
+        fprintf('Packet candidate %d: %s (%s).\n', ...
+            candidateId, packetMacs{candidateId}, ...
+            packetMacStatus{candidateId});
+    else
+        fprintf('Packet candidate %d received from transmitter %s.\n', ...
+            candidateId, packetMacs{candidateId});
+    end
+end
 
 %% Raw I/Q waveform with packet-field markers
 t = (0:length(sig)-1) / sampleRate;
@@ -179,7 +232,8 @@ for p = 1:size(packetPlotInfo, 1)
     startTimeMs = (packetPlotInfo(p, 1) - 1) / sampleRate * 1e3;
     endTimeMs = (packetPlotInfo(p, 5) - 1) / sampleRate * 1e3;
     packetNumber = packetPlotInfo(p, 6);
-    xline(startTimeMs, '-', sprintf('Packet %d start', packetNumber), ...
+    xline(startTimeMs, '-', ...
+        sprintf('Packet %d | %s', packetNumber, packetMacs{packetNumber}), ...
         'Color', [0 0.45 0.74]);
     xline(endTimeMs, '-', sprintf('Packet %d end', packetNumber), ...
         'Color', [0.85 0.1 0.1], ...
@@ -197,8 +251,9 @@ if ~isempty(packetPlotInfo)
 
     figure('Color', 'w');
     plot(t(timeRange) * 1e3, abs(sig(timeRange)));
-    title(sprintf('Wi-Fi IQ Magnitude - First Decoded Packet (%.3f ms)', ...
-        firstPacketDurationMs));
+    firstCandidateId = packetPlotInfo(1, 6);
+    title(sprintf('Packet %d from %s (%.3f ms)', firstCandidateId, ...
+        packetMacs{firstCandidateId}, firstPacketDurationMs));
     xlabel('Time (ms)');
     ylabel('|IQ|');
     grid on;
@@ -231,7 +286,8 @@ if ~isempty(packetPlotInfo)
     headerRange = packetStart:headerEnd;
     figure('Color', 'w');
     plot(t(headerRange) * 1e3, abs(sig(headerRange)));
-    title('Wi-Fi IQ Magnitude - Preamble and Header Detail');
+    title(sprintf('Preamble and Header - Packet %d from %s', ...
+        firstCandidateId, packetMacs{firstCandidateId}));
     xlabel('Time (ms)');
     ylabel('|IQ|');
     grid on;
@@ -249,29 +305,81 @@ end
 %% 3. Visualization
 if ~isempty(csiDataset)
     figure('Color', 'w');
-    
-    % Subcarrier Magnitude & Phase
+
     subcarrierIdx = [-26:-1, 1:26];
-    sampleCSI = csiDataset(1, :);
+    [routerLabels, ~, routerGroup] = unique(featureRouterMacs);
+    routerColors = lines(length(routerLabels));
     
     subplot(3,1,1);
-    stem(subcarrierIdx, abs(sampleCSI), 'filled', 'LineWidth', 1.2);
+    hold on;
+    for packetIdx = 1:size(csiDataset, 1)
+        groupIdx = routerGroup(packetIdx);
+        plot(subcarrierIdx, abs(csiDataset(packetIdx, :)), '-o', ...
+            'Color', routerColors(groupIdx, :), ...
+            'DisplayName', sprintf('Packet %d | %s', ...
+            featureCandidateIds(packetIdx), featureRouterMacs{packetIdx}));
+    end
     title('Wi-Fi Subcarrier Channel Magnitude (|H[k]|)');
-    xlabel('Subcarrier Index'); ylabel('|H|'); grid on;
+    xlabel('Subcarrier Index'); ylabel('|H|'); grid on; legend('show');
     
     subplot(3,1,2);
-    plot(subcarrierIdx, unwrap(angle(sampleCSI)), '-o', 'LineWidth', 1.2);
+    hold on;
+    for packetIdx = 1:size(csiDataset, 1)
+        groupIdx = routerGroup(packetIdx);
+        plot(subcarrierIdx, unwrap(angle(csiDataset(packetIdx, :))), '-o', ...
+            'Color', routerColors(groupIdx, :), ...
+            'DisplayName', sprintf('Packet %d | %s', ...
+            featureCandidateIds(packetIdx), featureRouterMacs{packetIdx}));
+    end
     title('Wi-Fi Subcarrier Phase (\angle H[k])');
-    xlabel('Subcarrier Index'); ylabel('Phase (rad)'); grid on;
+    xlabel('Subcarrier Index'); ylabel('Phase (rad)'); grid on; legend('show');
     
     subplot(3,1,3);
-    histogram(powerDataset(:, 1), 20);
+    hold on;
+    for groupIdx = 1:length(routerLabels)
+        groupPackets = routerGroup == groupIdx;
+        histogram(powerDataset(groupPackets, 1), 20, ...
+            'DisplayName', sprintf('%s (%d packets)', routerLabels{groupIdx}, ...
+            sum(groupPackets)));
+    end
     title('Received Packet Power Distribution (dB)');
-    xlabel('Power (dBFS)'); ylabel('Frame Count'); grid on;
+    xlabel('Power (dBFS)'); ylabel('Frame Count'); grid on; legend('show');
 end
 
 %% Helper CFO correction function
 function out = helperFrequencyOffset(in, fOffset, fs, startSample)
     t = (startSample - 1 + (0:length(in)-1).') / fs;
     out = in .* exp(1j * 2 * pi * fOffset * t);
+end
+
+function [macAddress, statusMessage] = helperExtractTransmitterAddress(psduBits)
+    macAddress = 'MAC unavailable';
+    statusMessage = 'MAC frame could not be decoded';
+    [macConfig, ~, decodeStatus] = wlanMPDUDecode(psduBits, 'Non-HT');
+    if decodeStatus ~= 0
+        statusMessage = sprintf( ...
+            'MAC frame decode failed (wlanMPDUDecode status %d)', decodeStatus);
+        return;
+    end
+    if ~macConfig.Decoded
+        statusMessage = 'MAC frame did not pass decoder validation';
+        return;
+    end
+
+    frameType = char(macConfig.FrameType);
+    if strcmpi(frameType, 'ACK') || strcmpi(frameType, 'CTS')
+        statusMessage = sprintf( ...
+            'decoded %s control frame has no transmitter address', frameType);
+        return;
+    end
+
+    address = char(macConfig.Address2);
+    if length(address) ~= 12
+        statusMessage = 'decoded frame has no valid transmitter address';
+        return;
+    end
+
+    macAddress = sprintf('%s:%s:%s:%s:%s:%s', ...
+        address(1:2), address(3:4), address(5:6), ...
+        address(7:8), address(9:10), address(11:12));
 end
