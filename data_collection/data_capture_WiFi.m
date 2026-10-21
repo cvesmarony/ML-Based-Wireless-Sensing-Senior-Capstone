@@ -1,7 +1,7 @@
 clear; %test
 %% Configuration
 sampleRate   = 20e6;
-CaptureTime  = 0.1;                       % 100 ms burst capture
+CaptureTime  = 0.1;                        % 100 ms burst capture
 TotalSamples = round(sampleRate * CaptureTime);
 channel      = 6;
 centerFreq   = 2407e6 + 5e6 * channel;
@@ -9,7 +9,7 @@ centerFreq   = 2407e6 + 5e6 * channel;
 %% Hardware / Capture Interface
 rxObj = comm.SDRuReceiver( ...
     'Platform',           'B210', ...
-    'SerialNum',          '34C78EF', ... #will have to check this with "findsdru"
+    'SerialNum',          '34C78FD', ... #will have to check this with "findsdru"
     'MasterClockRate',    20e6, ...
     'DecimationFactor',   1, ...
     'SamplesPerFrame',    TotalSamples, ...
@@ -66,6 +66,7 @@ packetMacs = repmat({'MAC unavailable'}, length(pktStarts), 1);
 packetMacStatus = repmat({'L-SIG was not decoded'}, length(pktStarts), 1);
 featureCandidateIds = zeros(length(pktStarts), 1);
 featureRouterMacs = cell(length(pktStarts), 1);
+packetPowerDb = NaN(length(pktStarts), 1);
 featureCount = 0;
 
 %% 2. Process Detected Packets
@@ -103,9 +104,12 @@ for p = 1:length(pktStarts)
     lltf_raw = sig(lltfStart : lltfStart + 160 - 1);
     
     % --- Fine Frequency Offset Correction using L-LTF ---
-    cfoFine = wlanFineCFOEstimate(lltf_raw, 'CBW20');
+    lltf_coarseCorrected = helperFrequencyOffset( ...
+        lltf_raw, -cfoCoarse, sampleRate, lltfStart);
+    cfoFine = wlanFineCFOEstimate(lltf_coarseCorrected, 'CBW20');
+    cfoTotal = cfoCoarse + cfoFine;
     lltf_corrected = helperFrequencyOffset( ...
-        lltf_raw, -(cfoCoarse + cfoFine), sampleRate, lltfStart);
+        lltf_raw, -cfoTotal, sampleRate, lltfStart);
     
     % --- Demodulate L-LTF and Estimate CSI ---
     % Demodulation performs FFT and discards the cyclic prefix
@@ -118,7 +122,7 @@ for p = 1:length(pktStarts)
     if lsigStart + 79 <= length(sig)
         lsig = sig(lsigStart : lsigStart + 79);
         lsigCorrected = helperFrequencyOffset( ...
-            lsig, -(cfoCoarse + cfoFine), sampleRate, lsigStart);
+            lsig, -cfoTotal, sampleRate, lsigStart);
         [lsigBits, lsigFail] = wlanLSIGRecover( ...
             lsigCorrected, chanEst, noiseVarEst, 'CBW20');
         if ~lsigFail
@@ -135,8 +139,7 @@ for p = 1:length(pktStarts)
                 dataStart = syncStart + 400;
                 packetEnd = phyStart + 400 + 80 * dataSymbols;
 
-                % Recover the PSDU to read the MAC transmitter address.
-                % Address 2 is the transmitter address for management/data frames.
+                % Recover the PSDU to identify beacon frames and their BSSID.
                 if psduLength < 10
                     packetMacStatus{p} = 'L-SIG PSDU length is too short for a MAC header';
                 elseif packetEnd > length(sig)
@@ -146,8 +149,7 @@ for p = 1:length(pktStarts)
                 else
                     dataSamples = sig(dataStart:packetEnd-1);
                     dataCorrected = helperFrequencyOffset( ...
-                        dataSamples, -(cfoCoarse + cfoFine), ...
-                        sampleRate, dataStart);
+                        dataSamples, -cfoTotal, sampleRate, dataStart);
                     nonHTConfig = wlanNonHTConfig( ...
                         'ChannelBandwidth', 'CBW20', ...
                         'MCS', rateIdx - 1, ...
@@ -155,7 +157,7 @@ for p = 1:length(pktStarts)
                     psduBits = wlanNonHTDataRecover( ...
                         dataCorrected, chanEst, noiseVarEst, nonHTConfig);
                     [packetMacs{p}, packetMacStatus{p}] = ...
-                        helperExtractTransmitterAddress(psduBits);
+                        helperExtractBeaconBssid(psduBits);
                 end
 
                 plotPacketCount = plotPacketCount + 1;
@@ -176,6 +178,7 @@ for p = 1:length(pktStarts)
     % Total packet preamble power (instantaneous power profile)
     pktPwrLinear = mean(abs(lltf_corrected).^2);
     pktPwr_dB = 10 * log10(pktPwrLinear + eps);
+    packetPowerDb(p) = pktPwr_dB;
     
     % Subcarrier-averaged channel power
     csiPower_dB = 10 * log10(mean(abs(chanEst).^2) + eps);
@@ -193,14 +196,40 @@ packetPlotInfo = packetPlotInfo(1:plotPacketCount, :);
 featureCandidateIds = featureCandidateIds(1:featureCount);
 featureRouterMacs = featureRouterMacs(1:featureCount);
 
-for candidateId = 1:length(pktStarts)
-    if strcmp(packetMacs{candidateId}, 'MAC unavailable')
-        fprintf('Packet candidate %d: %s (%s).\n', ...
-            candidateId, packetMacs{candidateId}, ...
-            packetMacStatus{candidateId});
+macPrefix = '6C:D6:E3:58:';
+validatedBssidMask = ~strcmp(packetMacs, 'MAC unavailable') & ...
+    isfinite(packetPowerDb) & ...
+    strcmp(packetMacStatus, 'validated beacon BSSID');
+validBssidMask = validatedBssidMask & ...
+    strncmp(packetMacs, macPrefix, length(macPrefix));
+if any(validBssidMask)
+    observedBssids = packetMacs(validBssidMask);
+    observedPowers = packetPowerDb(validBssidMask);
+    [distinctBssids, ~, bssidGroups] = unique(observedBssids);
+    bssidPeakPowers = accumarray(bssidGroups, observedPowers, [], @max);
+    [rankedPeakPowers, rankedGroups] = sort(bssidPeakPowers, 'descend');
+    fprintf('Found %d distinct validated beacon BSSID(s):\n', ...
+        length(rankedGroups));
+    for rank = 1:length(rankedGroups)
+        bssid = distinctBssids{rankedGroups(rank)};
+        candidateIds = find(strcmp(packetMacs, bssid));
+        fprintf('%d. %s (peak power %.2f dB; %d packet(s))\n', ...
+            rank, bssid, rankedPeakPowers(rank), length(candidateIds));
+        for candidateIdx = 1:length(candidateIds)
+            candidateId = candidateIds(candidateIdx);
+            fprintf('   Candidate %d: %.2f dB (%s).\n', ...
+                candidateId, packetPowerDb(candidateId), ...
+                packetMacStatus{candidateId});
+        end
+    end
+else
+    if any(validatedBssidMask)
+        fprintf(['No validated beacon BSSIDs matched prefix %s ' ...
+            '(%d other validated BSSID(s) found).\n'], ...
+            macPrefix, sum(validatedBssidMask));
     else
-        fprintf('Packet candidate %d received from transmitter %s.\n', ...
-            candidateId, packetMacs{candidateId});
+        fprintf(['No beacon BSSIDs passed MPDU validation; ' ...
+            'non-beacon frames are not reported as router BSSIDs.\n']);
     end
 end
 
@@ -352,34 +381,31 @@ function out = helperFrequencyOffset(in, fOffset, fs, startSample)
     out = in .* exp(1j * 2 * pi * fOffset * t);
 end
 
-function [macAddress, statusMessage] = helperExtractTransmitterAddress(psduBits)
+function [macAddress, statusMessage] = helperExtractBeaconBssid(psduBits)
     macAddress = 'MAC unavailable';
-    statusMessage = 'MAC frame could not be decoded';
-    [macConfig, ~, decodeStatus] = wlanMPDUDecode(psduBits, 'Non-HT');
-    if decodeStatus ~= 0
+    [macConfig, ~, decodeStatus] = wlanMPDUDecode( ...
+        psduBits, 'Non-HT', 'SuppressWarnings', true);
+    if decodeStatus ~= 0 || ~macConfig.Decoded
         statusMessage = sprintf( ...
-            'MAC frame decode failed (wlanMPDUDecode status %d)', decodeStatus);
-        return;
-    end
-    if ~macConfig.Decoded
-        statusMessage = 'MAC frame did not pass decoder validation';
+            'MPDU failed validation (wlanMPDUDecode status %d)', decodeStatus);
         return;
     end
 
     frameType = char(macConfig.FrameType);
-    if strcmpi(frameType, 'ACK') || strcmpi(frameType, 'CTS')
+    if ~strcmpi(frameType, 'Beacon')
         statusMessage = sprintf( ...
-            'decoded %s control frame has no transmitter address', frameType);
+            'decoded %s frame is not a beacon; BSSID not reported', frameType);
         return;
     end
 
-    address = char(macConfig.Address2);
+    address = char(macConfig.Address3);
     if length(address) ~= 12
-        statusMessage = 'decoded frame has no valid transmitter address';
+        statusMessage = 'decoded beacon has no valid BSSID';
         return;
     end
 
     macAddress = sprintf('%s:%s:%s:%s:%s:%s', ...
         address(1:2), address(3:4), address(5:6), ...
         address(7:8), address(9:10), address(11:12));
+    statusMessage = 'validated beacon BSSID';
 end
