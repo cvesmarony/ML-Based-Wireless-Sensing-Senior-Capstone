@@ -19,11 +19,11 @@ tx_pos = [13, 8, 0.875];
 %tx_pos = [6, 5, 1.021];
 
 if x_lab == round(x_lab) && y_lab == round(y_lab)
-    data_folder = "mimo_data_f2/";
+    data_folder = "data_f2/";
 elseif x_lab == round(x_lab) || y_lab == round(y_lab)
     disp("Something is mismatched check x y")
 else
-    data_folder = "mimo_test_data_f2/";
+    data_folder = "test_data_f2/";
 end
 
 
@@ -39,7 +39,7 @@ TotalSamples = round(Fs * CaptureTime);
 % -------------------------------------------------------------------------
 rxObj = comm.SDRuReceiver( ...
     'Platform',          'B210', ...
-    'SerialNum',         '34C78FD', ...
+    'SerialNum',         '3839223', ...
     'MasterClockRate',   30e6, ...
     'DecimationFactor',  60, ...
     'SamplesPerFrame',   TotalSamples, ...
@@ -77,9 +77,9 @@ raw_data.mimo        = false;
 raw_data.rx_orient   = orientation;
     
 if x_lab >= 0
-    filename = data_folder + 'mimo_tx' + string(tx_num) + '_' + string(x_lab) + '_' + string(y_lab) + '_' + string(orientation) + '.mat';
+    filename = data_folder + 'beam_tx' + string(tx_num) + '_' + string(x_lab) + '_' + string(y_lab) + '_' + string(orientation) + '.mat';
 else
-    filename = data_folder + 'mimo_tx' + string(tx_num) + '_n1_' + string(y_lab) + '_' + string(orientation) + '.mat';
+    filename = data_folder + 'beam_tx' + string(tx_num) + '_n1_' + string(y_lab) + '_' + string(orientation) + '.mat';
 end
 
 % if you f-up a file then just uncomment this and ignore the error
