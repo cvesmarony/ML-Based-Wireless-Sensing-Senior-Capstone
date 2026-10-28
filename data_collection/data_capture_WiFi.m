@@ -11,12 +11,12 @@ saveFullCapture = false;        % also save the whole raw buffer (~16 MB per 100
 
 %% Configuration
 sampleRate   = 20e6;
-CaptureTime  = 0.1;                        % 100 ms burst capture
+CaptureTime  = 0.01;                        % 100 ms burst capture
 TotalSamples = round(sampleRate * CaptureTime);
 channel      = 6;
 centerFreq   = 2407e6 + 5e6 * channel;
 rxGain       = 45;
-sdrSerial    = '34C78FD';                  % check with "findsdru"
+sdrSerial    = '3839223';                  % check with "findsdru"
 antennaPort  = 'RX2';
 
 % Packets below minSnrDb are dropped before decoding (even the 6 Mb/s L-SIG
@@ -90,6 +90,7 @@ packetMacs = repmat({'MAC unavailable'}, length(pktStarts), 1);
 packetMacStatus = repmat({'L-SIG was not decoded'}, length(pktStarts), 1);
 featureCandidateIds = zeros(length(pktStarts), 1);
 featureRouterMacs = cell(length(pktStarts), 1);
+featureCfoHz = NaN(length(pktStarts), 1);
 packetPowerDb = NaN(length(pktStarts), 1);
 packetSnrDb = NaN(length(pktStarts), 1);
 packetCfoHz = NaN(length(pktStarts), 1);
@@ -261,10 +262,12 @@ for p = 1:length(pktStarts)
     featureCount = featureCount + 1;
     featureCandidateIds(featureCount) = p;
     featureRouterMacs{featureCount} = packetMacs{p};
+    featureCfoHz(featureCount) = cfoTotal;
 end
 packetPlotInfo = packetPlotInfo(1:plotPacketCount, :);
 featureCandidateIds = featureCandidateIds(1:featureCount);
 featureRouterMacs = featureRouterMacs(1:featureCount);
+featureCfoHz = featureCfoHz(1:featureCount);
 
 %% Report BSSIDs and compare them with the MACs printed on the routers
 % The MAC on a router's sticker is usually its Ethernet/base MAC. The BSSID
@@ -475,48 +478,151 @@ else
     warning('Could not decode an L-SIG field; packet end markers are unavailable.');
 end
 
-%% 3. Visualization
+%% 3. Visualization (one figure per plot, sized for slides)
 if ~isempty(csiDataset)
-    figure('Color', 'w');
-
     subcarrierIdx = [-26:-1, 1:26];
+    nFeatures = size(csiDataset, 1);
     [routerLabels, ~, routerGroup] = unique(featureRouterMacs);
-    routerColors = lines(length(routerLabels));
-    
-    subplot(3,1,1);
-    hold on;
-    for packetIdx = 1:size(csiDataset, 1)
-        groupIdx = routerGroup(packetIdx);
-        plot(subcarrierIdx, abs(csiDataset(packetIdx, :)), '-o', ...
-            'Color', routerColors(groupIdx, :), ...
-            'DisplayName', sprintf('Packet %d | %s', ...
-            featureCandidateIds(packetIdx), featureRouterMacs{packetIdx}));
+    % Fixed color order; routers past the sixth share gray.
+    palette = [0x2a 0x78 0xd6; 0xeb 0x68 0x34; 0x1b 0xaf 0x7a; ...
+               0xed 0xa1 0x00; 0xe8 0x7b 0xa4; 0x00 0x83 0x00] / 255;
+    routerColors = repmat([0.6 0.6 0.6], length(routerLabels), 1);
+    nColored = min(6, length(routerLabels));
+    routerColors(1:nColored, :) = palette(1:nColored, :);
+    slideSize = [100 100 1100 620];
+
+    % Phase with the linear term (timing offset) and constant term
+    % (residual CFO) removed, leaving the channel's own phase shape.
+    csiPhase = unwrap(angle(csiDataset), [], 2);
+    for packetIdx = 1:nFeatures
+        coeffs = polyfit(subcarrierIdx, csiPhase(packetIdx, :), 1);
+        csiPhase(packetIdx, :) = csiPhase(packetIdx, :) - ...
+            polyval(coeffs, subcarrierIdx);
     end
-    title('Wi-Fi Subcarrier Channel Magnitude (|H[k]|)');
-    xlabel('Subcarrier Index'); ylabel('|H|'); grid on; legend('show');
-    
-    subplot(3,1,2);
-    hold on;
-    for packetIdx = 1:size(csiDataset, 1)
-        groupIdx = routerGroup(packetIdx);
-        plot(subcarrierIdx, unwrap(angle(csiDataset(packetIdx, :))), '-o', ...
-            'Color', routerColors(groupIdx, :), ...
-            'DisplayName', sprintf('Packet %d | %s', ...
-            featureCandidateIds(packetIdx), featureRouterMacs{packetIdx}));
+
+    % Power delay profile: IFFT of the CSI zero-padded to 512 points
+    % (3.2 us span, 6.25 ns bins), aligned to the strongest path since a
+    % single unsynchronized receiver has no absolute delay reference.
+    nfft = 512;
+    dtPdp = 3.2e-6 / nfft;
+    leadSamples = round(200e-9 / dtPdp);
+    pdpDb = zeros(nFeatures, nfft);
+    for packetIdx = 1:nFeatures
+        H = zeros(nfft, 1);
+        H(mod(subcarrierIdx, nfft) + 1) = csiDataset(packetIdx, :);
+        h = ifft(H);
+        [~, peakIdx] = max(abs(h));
+        h = circshift(h, leadSamples - (peakIdx - 1));
+        pdpDb(packetIdx, :) = 20 * log10(abs(h) / max(abs(h)) + eps);
     end
-    title('Wi-Fi Subcarrier Phase (\angle H[k])');
-    xlabel('Subcarrier Index'); ylabel('Phase (rad)'); grid on; legend('show');
-    
-    subplot(3,1,3);
-    hold on;
+    tauNs = ((0:nfft-1) - leadSamples) * dtPdp * 1e9;
+    featureTimeMs = (pktStarts(featureCandidateIds) - 1) / sampleRate * 1e3;
+
+    % CSI magnitude
+    figure('Color', 'w', 'Position', slideSize);
+    ax = gca; hold(ax, 'on');
+    helperPlotByRouter(ax, subcarrierIdx, abs(csiDataset), routerGroup, ...
+        routerLabels, routerColors);
+    title(ax, 'CSI Magnitude |H[k]| (L-LTF)');
+    xlabel(ax, 'Subcarrier Index'); ylabel(ax, '|H|');
+    helperStyleSlideAxes(ax);
+
+    % CSI phase
+    figure('Color', 'w', 'Position', slideSize);
+    ax = gca; hold(ax, 'on');
+    helperPlotByRouter(ax, subcarrierIdx, csiPhase, routerGroup, ...
+        routerLabels, routerColors);
+    title(ax, 'CSI Phase \angleH[k], Linear Trend Removed');
+    xlabel(ax, 'Subcarrier Index'); ylabel(ax, 'Phase (rad)');
+    helperStyleSlideAxes(ax);
+
+    % Packet power
+    figure('Color', 'w', 'Position', slideSize);
+    ax = gca; hold(ax, 'on');
     for groupIdx = 1:length(routerLabels)
         groupPackets = routerGroup == groupIdx;
-        histogram(powerDataset(groupPackets, 1), 20, ...
+        histogram(ax, powerDataset(groupPackets, 1), 20, ...
+            'FaceColor', routerColors(groupIdx, :), 'EdgeColor', 'w', ...
             'DisplayName', sprintf('%s (%d packets)', routerLabels{groupIdx}, ...
             sum(groupPackets)));
     end
-    title('Received Packet Power Distribution (dB)');
-    xlabel('Power (dBFS)'); ylabel('Frame Count'); grid on; legend('show');
+    title(ax, 'Received Packet Power Distribution');
+    xlabel(ax, 'Power (dBFS)'); ylabel(ax, 'Frame Count');
+    helperStyleSlideAxes(ax);
+
+    % Power delay profile
+    figure('Color', 'w', 'Position', slideSize);
+    ax = gca; hold(ax, 'on');
+    helperPlotByRouter(ax, tauNs, pdpDb, routerGroup, routerLabels, routerColors);
+    xlim(ax, [-200 1000]); ylim(ax, [-30 1]);
+    title(ax, 'Power Delay Profile (IFFT of CSI)');
+    xlabel(ax, 'Delay Relative to Strongest Path (ns)');
+    ylabel(ax, 'Power (dB, normalized)');
+    helperStyleSlideAxes(ax);
+
+    % CFO over time: a transmitter's oscillator offset stays near-constant
+    figure('Color', 'w', 'Position', slideSize);
+    ax = gca; hold(ax, 'on');
+    for groupIdx = 1:length(routerLabels)
+        groupPackets = routerGroup == groupIdx;
+        scatter(ax, featureTimeMs(groupPackets), featureCfoHz(groupPackets) / 1e3, ...
+            80, routerColors(groupIdx, :), 'filled', 'MarkerEdgeColor', 'w', ...
+            'DisplayName', routerLabels{groupIdx});
+    end
+    title(ax, 'Carrier Frequency Offset Over Time');
+    xlabel(ax, 'Time in Capture (ms)'); ylabel(ax, 'CFO (kHz)');
+    helperStyleSlideAxes(ax);
+
+    % CFO vs power: separate clusters ~ separate transmitters
+    figure('Color', 'w', 'Position', slideSize);
+    ax = gca; hold(ax, 'on');
+    for groupIdx = 1:length(routerLabels)
+        groupPackets = routerGroup == groupIdx;
+        scatter(ax, powerDataset(groupPackets, 1), featureCfoHz(groupPackets) / 1e3, ...
+            80, routerColors(groupIdx, :), 'filled', 'MarkerEdgeColor', 'w', ...
+            'DisplayName', routerLabels{groupIdx});
+    end
+    title(ax, 'CFO vs Packet Power (Transmitter Fingerprint)');
+    xlabel(ax, 'Power (dBFS)'); ylabel(ax, 'CFO (kHz)');
+    helperStyleSlideAxes(ax);
+
+    % CSI magnitude heatmap, packets in capture order
+    figure('Color', 'w', 'Position', slideSize);
+    ax = gca;
+    imagesc(ax, subcarrierIdx, 1:nFeatures, 20 * log10(abs(csiDataset) + eps));
+    blueRamp = [0xcd 0xe2 0xfb; 0x9e 0xc5 0xf4; 0x6d 0xa7 0xec; 0x39 0x87 0xe5; ...
+                0x25 0x6a 0xbf; 0x18 0x4f 0x95; 0x0d 0x36 0x6b] / 255;
+    colormap(ax, interp1(linspace(0, 1, 7), blueRamp, linspace(0, 1, 256)));
+    cb = colorbar(ax); cb.Label.String = '|H| (dB)';
+    title(ax, 'CSI Magnitude, All Packets');
+    xlabel(ax, 'Subcarrier Index'); ylabel(ax, 'Packet (capture order)');
+    ax.FontSize = 16; ax.TitleFontSizeMultiplier = 1.2;
+end
+
+%% Helper plotting functions
+% One line per packet (rows of y), colored by router; only the first packet
+% of each router gets a legend entry.
+function helperPlotByRouter(ax, x, y, routerGroup, routerLabels, routerColors)
+    for groupIdx = 1:length(routerLabels)
+        rows = find(routerGroup == groupIdx);
+        for k = 1:length(rows)
+            h = plot(ax, x, y(rows(k), :), 'LineWidth', 1.5, ...
+                'Color', [routerColors(groupIdx, :) 0.6]);
+            if k == 1
+                h.DisplayName = sprintf('%s (%d packets)', ...
+                    routerLabels{groupIdx}, length(rows));
+            else
+                h.HandleVisibility = 'off';
+            end
+        end
+    end
+end
+
+function helperStyleSlideAxes(ax)
+    ax.FontSize = 16;
+    ax.TitleFontSizeMultiplier = 1.2;
+    grid(ax, 'on'); ax.GridAlpha = 0.15; box(ax, 'off');
+    legend(ax, 'Location', 'bestoutside', 'Interpreter', 'none');
 end
 
 %% Helper CFO correction function
