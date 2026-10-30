@@ -1,4 +1,4 @@
-clear; %test
+clear; clc;
 %% Capture metadata - adjust before every capture
 locationName = 'unspecified';   % e.g. 'Halligan 102'
 x_lab        = 0;               % RX position in the room grid
@@ -99,6 +99,8 @@ packetRateMbps = NaN(length(pktStarts), 1);
 packetPsduLength = NaN(length(pktStarts), 1);
 packetFormat = repmat({''}, length(pktStarts), 1);
 featureCount = 0;
+firstDecodedHeader = [];  % raw 24-byte MAC header, FCS-validated
+firstDecodedPacket = NaN;
 
 %% 2. Process Detected Packets
 previousPacketEnd = 0;
@@ -224,6 +226,19 @@ for p = 1:length(pktStarts)
                         dataCorrected, chanEst, noiseVarEst, nonHTConfig);
                     [packetMacs{p}, packetMacStatus{p}] = ...
                         helperExtractBssid(psduBits);
+                    % Retain the FIRST validated management MAC header.
+                    % PSDU bits are transmitted LSB-first within each byte.
+                    % Only show a real decoded header, never synthetic fields.
+                    if isempty(firstDecodedHeader) && ...
+                            ~strcmp(packetMacs{p}, 'MAC unavailable') && ...
+                            numel(psduBits) >= 8*28
+                        octets = (2.^(0:7)) * reshape(double(psduBits), 8, []);
+                        typeBits = bitand(bitshift(octets(1), -2), 3);
+                        if typeBits == 0 && helperFcsValid(octets)
+                            firstDecodedHeader = uint8(octets(1:24));
+                            firstDecodedPacket = p;
+                        end
+                    end
                 end
 
                 packetCfoHz(p) = cfoTotal;
@@ -387,54 +402,105 @@ else
     fprintf('Saved %d packet(s) with a BSSID to %s\n', length(packets), filename);
 end
 
-%% Plot decoded MAC information only (BSSID-colored scatter plot)
-% Show only frames whose BSSID was recovered and validated by the decoder.
-% These markers visualize decoded MAC metadata, not raw header bits.
-validCandidates = find(~strcmp(packetMacs, 'MAC unavailable') & ...
-    isfinite(packetPowerDb));
-
-if isempty(validCandidates)
-    fprintf('No FCS-validated MAC BSSIDs were recovered in this capture.\n');
-    fprintf('Check packetMacStatus for the reason each decode failed.\n');
+%% MAC HEADER FIELD DIAGRAM (only plot)
+% Plot the first FCS-validated 24-byte management MAC header.
+% Management frames include Beacon, Probe Response, Action, etc.
+% The captured data, not guessed values, supplies all field contents.
+if isempty(firstDecodedHeader)
+    fprintf('No validated management-frame MAC header available to plot.\n');
+    fprintf('See packetMacStatus for decode failure reasons.\n');
 else
-    packetIds = validCandidates(:);
-    arrivalMs = (pktStarts(packetIds) - 1) / sampleRate * 1e3;
-    powers = packetPowerDb(packetIds);
-    addresses = packetMacs(packetIds);
-    descriptions = packetMacStatus(packetIds);
+    helperPlotMacHeader(firstDecodedHeader, firstDecodedPacket);
+end
 
-    [uniqueBSSIDs, ~, groupIdx] = unique(addresses, 'stable');
-    colors = lines(numel(uniqueBSSIDs));
+%% Field layout diagram helper
+function helperPlotMacHeader(header, packetId)
+    % Standard 802.11 management MAC header: 24 bytes total.
+    fieldNames = {'Frame Control', 'Duration/ID', 'Address 1', ...
+                  'Address 2', 'Address 3 (BSSID)', 'Sequence Control'};
+    shortNames = {'FC', 'Duration', 'Address 1', ...
+                  'Address 2', 'BSSID', 'Sequence'};
+    byteWidths = [2 2 6 6 6 2];
+    firstByte = [1, cumsum(byteWidths(1:end-1))+1];
+    colors = [0.73 0.85 0.98; 0.85 0.91 0.74; ...
+              1.00 0.88 0.66; 0.99 0.78 0.77; ...
+              0.74 0.90 0.84; 0.86 0.82 0.97];
 
-    figure('Color', 'w', 'Name', 'Decoded Wi-Fi MAC Headers', ...
-        'NumberTitle', 'off', 'Position', [100 100 1200 650]);
-    ax = axes; hold(ax, 'on');
-
-    for k = 1:numel(uniqueBSSIDs)
-        mask = groupIdx == k;
-        scatter(ax, arrivalMs(mask), powers(mask), 130, ...
-            colors(k, :), 'filled', 'DisplayName', uniqueBSSIDs{k});
+    % Read actual raw byte values from the recovered MPDU header.
+    bytes = double(header(:)).';
+    values = cell(1,6);
+    for k = 1:6
+        b = bytes(firstByte(k):firstByte(k)+byteWidths(k)-1);
+        if k >= 3 && k <= 5
+            values{k} = strjoin(cellstr(dec2hex(b(:),2)), ':');
+        else
+            values{k} = strtrim(sprintf('%02X ', b));
+        end
     end
 
-    % Label the frame subtype beside each decoded point.
-    for k = 1:numel(packetIds)
-        frameType = regexprep(descriptions{k}, '^BSSID from ', '');
-        frameType = regexprep(frameType, ' frame$', '');
-        text(ax, arrivalMs(k) + 0.35, powers(k), ...
-            sprintf('%s (pkt %d)', frameType, packetIds(k)), ...
-            'FontSize', 10, 'Interpreter', 'none', ...
-            'VerticalAlignment', 'bottom');
+    fc = bytes(1) + 256*bytes(2);
+    frameType = bitand(bitshift(fc,-2),3);
+    frameSubtype = bitand(bitshift(fc,-4),15);
+    mgmtTypes = {'Association request','Association response', ...
+                 'Reassociation request','Reassociation response', ...
+                 'Probe request','Probe response','Timing advertisement', ...
+                 'Reserved','Beacon','ATIM','Disassociation', ...
+                 'Authentication','Deauthentication','Action', ...
+                 'Action No Ack','Reserved'};
+    if frameType == 0
+        description = mgmtTypes{frameSubtype+1};
+    else
+        description = sprintf('MAC type %d / subtype %d',frameType,frameSubtype);
     end
+    duration = bytes(3) + 256*bytes(4);
+    seqField = bytes(23) + 256*bytes(24);
+    sequenceNumber = bitshift(seqField,-4);
+    fragmentNumber = bitand(seqField,15);
 
-    title(ax, sprintf('Decoded IEEE 802.11 MAC Information (%d frames)', ...
-        numel(packetIds)));
-    xlabel(ax, 'Packet Arrival Time (ms)');
-    ylabel(ax, 'Received Power (dBFS)');
-    xlim(ax, [0 CaptureTime*1e3 + 5]);
-    grid(ax, 'on'); box(ax, 'off');
-    set(ax, 'FontSize', 13);
-    legend(ax, 'Location', 'bestoutside', 'Interpreter', 'none');
-    hold(ax, 'off');
+    fig = figure('Color','w','Name','Decoded 802.11 MAC Header', ...
+        'NumberTitle','off','Position',[100 100 1450 580]);
+    ax = axes('Parent',fig,'Position',[0.05 0.12 0.90 0.74]);
+    axis(ax,[0 24 0 1]); axis(ax,'off'); hold(ax,'on');
+    title(ax,sprintf('Decoded IEEE 802.11 MAC Header | Packet %d | %s', ...
+        packetId,description),'FontSize',16,'FontWeight','bold','Color','k');
+
+    % Bit/byte-layout style: rectangles scale to the field's byte width.
+    % Short 2-byte fields have annotations outside their rectangles
+    % to prevent the actual hex values becoming unreadable.
+    y = 0.48; boxHeight = 0.23;
+    x = 0;
+    for k = 1:6
+        w = byteWidths(k);
+        rectangle(ax,'Position',[x y w boxHeight], ...
+            'FaceColor',colors(k,:),'EdgeColor',[0.25 0.30 0.35], ...
+            'LineWidth',1.4);
+        text(ax,x+w/2,y+boxHeight/2,shortNames{k}, ...
+            'HorizontalAlignment','center','VerticalAlignment','middle', ...
+            'FontSize',11,'FontWeight','bold','Color','k');
+        text(ax,x+w/2,y+boxHeight+0.045, ...
+            sprintf('%d bytes',w),'HorizontalAlignment','center', ...
+            'FontSize',10,'Color','k');
+        if w == 2
+            valY = y-0.14;
+            fsize = 10;
+        else
+            valY = y-0.075;
+            fsize = 10;
+        end
+        text(ax,x+w/2,valY,values{k}, ...
+            'HorizontalAlignment','center','VerticalAlignment','middle', ...
+            'FontSize',fsize,'FontName','Courier New', ...
+            'Interpreter','none','Color','k');
+        x = x+w;
+    end
+    text(ax,12,0.12, sprintf(['Duration/ID: %d   |   Sequence: %d   |   ' ...
+          'Fragment: %d   |   BSSID: %s'],duration,sequenceNumber, ...
+          fragmentNumber,values{5}), ...
+          'HorizontalAlignment','center','FontSize',11, ...
+          'Interpreter','none','Color','k');
+    text(ax,12,0.02,'24-byte management MAC header (FCS validated)', ...
+          'HorizontalAlignment','center','FontSize',10, ...
+          'Color','k');
 end
 
 %% Helper CFO correction function
