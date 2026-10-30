@@ -139,9 +139,9 @@ def detect_packets(rx, ref_sig):
     min_prom = MIN_PROM_FRAC * np.max(corrMag)
     pks_locs, _ = sps_sig.find_peaks(corrMag, distance=MIN_PEAK_DIST, prominence=min_prom)
     pks_vals    = corrMag[pks_locs]
-    # sort_idx    = np.argsort(pks_vals)[::-1]
-    # pks_vals    = pks_vals[sort_idx]
-    # pks_locs    = pks_locs[sort_idx]
+    sort_idx    = np.argsort(pks_vals)[::-1]
+    pks_vals    = pks_vals[sort_idx]
+    pks_locs    = pks_locs[sort_idx]
     print(f"corrVals {corrVals[:10]}")
     return corrVals, corrMag, lags, pks_locs, pks_vals
 
