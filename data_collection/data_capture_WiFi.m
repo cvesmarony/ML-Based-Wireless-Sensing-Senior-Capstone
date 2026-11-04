@@ -1,23 +1,19 @@
-clear; %test
-%% Capture metadata - adjust before every capture
-locationName = 'unspecified';   % e.g. 'Halligan 102'
-x_lab        = 0;               % RX position in the room grid
-y_lab        = 0;
-rx_height    = 0.571;           % m
-orientation  = 0;               % RX orientation (deg)
-captureNotes = '';              % free text: people present, doors open, etc.
-data_folder  = 'wifi_data/';
-saveFullCapture = false;        % also save the whole raw buffer (~16 MB per 100 ms)
+clear;
+% Decodes and plots a raw capture saved by wifi_capture_raw.m (no radio
+% needed). Saves the decoded packets that carry a BSSID to data_folder.
 
-%% Configuration
-sampleRate   = 20e6;
-CaptureTime  = 0.01;                        % 100 ms burst capture
-TotalSamples = round(sampleRate * CaptureTime);
-channel      = 6;
-centerFreq   = 2407e6 + 5e6 * channel;
-rxGain       = 45;
-sdrSerial    = '3839223';                  % check with "findsdru"
-antennaPort  = 'RX2';
+%% Input / output
+rawFile     = '';               % '' = newest file in raw_folder
+raw_folder  = 'wifi_raw/';
+data_folder = 'wifi_data/';
+
+% RX combiner: both channels are captured and every multi-antenna input is
+% passed to the WLAN Toolbox functions as an [Ns x numRx] matrix. Detection,
+% timing and CFO estimation combine the antennas' correlations, and the L-SIG,
+% format and data recovery equalize each subcarrier across antennas, which for
+% a single spatial stream is maximal-ratio combining (MRC): each antenna is
+% weighted by conj(H_r[k]) / noise, so the combined SNR is the sum of the
+% per-antenna SNRs and a fade on one antenna is covered by the other.
 
 % Packets below minSnrDb are dropped before decoding (even the 6 Mb/s L-SIG
 % header is unreliable there). Payloads are only decoded when the SNR meets
@@ -26,31 +22,43 @@ minSnrDb      = 5;
 legacyRatesMbps = [6 9 12 18 24 36 48 54];
 requiredSnrDb   = [5 7 8 11 14 17 21 23];
 
-%% Hardware / Capture Interface
-rxObj = comm.SDRuReceiver( ...
-    'Platform',           'B210', ...
-    'SerialNum',          sdrSerial, ...
-    'MasterClockRate',    20e6, ...
-    'DecimationFactor',   1, ...
-    'SamplesPerFrame',    TotalSamples, ...
-    'CenterFrequency',    centerFreq, ...
-    'ChannelMapping',     1, ...
-    'ReceiveAntennaPort', antennaPort, ...
-    'Gain',               rxGain, ...
-    'OutputDataType',     'double');
+%% Load raw capture
+if isempty(rawFile)
+    rawFiles = dir(fullfile(raw_folder, 'raw_*.mat'));
+    if isempty(rawFiles)
+        error('No raw captures in %s. Run wifi_capture_raw.m first.', raw_folder);
+    end
+    [~, newest] = max([rawFiles.datenum]);
+    rawFile = fullfile(rawFiles(newest).folder, rawFiles(newest).name);
+end
+fprintf('Loading %s\n', rawFile);
+raw_wifi = load(rawFile).raw_wifi;
 
-disp('Capturing 20 MHz Wi-Fi frame...');
-% Host clock at the start of the capture call; USB latency makes this
-% accurate to a few ms, not to the sample.
-captureStartTime = datetime('now', 'TimeZone', 'local');
-[rxBuffer, ~, overrun] = rxObj();
-release(rxObj);
+rxBuffer     = raw_wifi.iq;
+sampleRate   = raw_wifi.Fs;
+CaptureTime  = raw_wifi.CaptureTime;
+channel      = raw_wifi.channel;
+centerFreq   = raw_wifi.freq;
+rxGain       = raw_wifi.gain_db;
+sdrSerial    = raw_wifi.sdr_serial;
+antennaPort  = raw_wifi.antenna_port;
+numRx        = raw_wifi.num_rx;
+overrun      = raw_wifi.overrun;
+locationName = raw_wifi.location;
+x_lab        = raw_wifi.rx_pos(1);
+y_lab        = raw_wifi.rx_pos(2);
+rx_height    = raw_wifi.rx_pos(3);
+orientation  = raw_wifi.rx_orient;
+captureNotes = raw_wifi.notes;
+captureStartTime = datetime(raw_wifi.capture_time_posix, ...
+    'ConvertFrom', 'posixtime', 'TimeZone', 'local');
 
 if overrun
-    warning('Buffer overrun detected. Some samples may be dropped.');
+    warning('This capture had a buffer overrun. Some samples may be missing.');
 end
 
-sig = rxBuffer(:, 1);
+sig = rxBuffer;               % [nSamples x numRx], one column per antenna
+nSamples = size(sig, 1);
 
 %% 1. Continuous Packet Detection
 % In a 100 ms buffer, there are likely multiple packets.
@@ -58,9 +66,9 @@ sig = rxBuffer(:, 1);
 threshold = 0.5;
 pktStarts = zeros(0, 1);
 scanStart = 1;
-while scanStart + 159 <= length(sig)
+while scanStart + 159 <= nSamples
     localPktStart = wlanPacketDetect( ...
-        sig(scanStart:end), 'CBW20', 0, threshold);
+        sig(scanStart:end, :), 'CBW20', 0, threshold);
     if isempty(localPktStart)
         break;
     end
@@ -81,7 +89,7 @@ end
 fprintf('Detected %d packet candidates.\n', length(pktStarts));
 
 % Data containers for training features
-csiDataset   = []; % [N_packets x 52] complex
+csiDataset   = []; % [N_packets x 52 x numRx] complex, per antenna
 powerDataset = []; % [N_packets x 1] dBm or linear power
 snrDataset   = []; % [N_packets x 1] estimated SNR
 packetPlotInfo = zeros(length(pktStarts), 6); % boundaries and detection candidate number
@@ -92,7 +100,8 @@ featureCandidateIds = zeros(length(pktStarts), 1);
 featureRouterMacs = cell(length(pktStarts), 1);
 featureCfoHz = NaN(length(pktStarts), 1);
 packetPowerDb = NaN(length(pktStarts), 1);
-packetSnrDb = NaN(length(pktStarts), 1);
+packetSnrDb = NaN(length(pktStarts), 1);      % post-MRC SNR
+packetSnrPerRxDb = NaN(length(pktStarts), numRx);
 packetCfoHz = NaN(length(pktStarts), 1);
 packetNoiseVar = NaN(length(pktStarts), 1);
 packetRateMbps = NaN(length(pktStarts), 1);
@@ -113,16 +122,16 @@ for p = 1:length(pktStarts)
     end
 
     % Leave room for fine timing to align the packet and for the legacy header.
-    if (pktStart + 320) > length(sig)
+    if (pktStart + 320) > nSamples
         packetMacStatus{p} = 'capture ended before the L-SIG field';
         continue;
     end
     
     % Extract preamble segment
-    preamble = sig(pktStart : min(pktStart + 400, length(sig)));
+    preamble = sig(pktStart : min(pktStart + 400, nSamples), :);
     
     % --- Coarse Frequency Offset Correction using L-STF ---
-    cfoCoarse = wlanCoarseCFOEstimate(preamble(1:160), 'CBW20');
+    cfoCoarse = wlanCoarseCFOEstimate(preamble(1:160, :), 'CBW20');
     preambleCorr = helperFrequencyOffset( ...
         preamble, -cfoCoarse, sampleRate, pktStart);
     
@@ -131,7 +140,7 @@ for p = 1:length(pktStarts)
     fineOffset = wlanSymbolTimingEstimate(preambleCorr, 'CBW20');
     syncStart = pktStart + fineOffset;
     
-    if syncStart < 1 || syncStart + 399 > length(sig)
+    if syncStart < 1 || syncStart + 399 > nSamples
         packetMacStatus{p} = 'capture ended before the synchronized packet header';
         continue;
     end
@@ -140,7 +149,7 @@ for p = 1:length(pktStarts)
     lltfStart = syncStart + 160;
 
     % Extract corrected L-LTF (160 samples: 32 CP + 64 T1 + 64 T2)
-    lltf_raw = sig(lltfStart : lltfStart + 160 - 1);
+    lltf_raw = sig(lltfStart : lltfStart + 160 - 1, :);
     
     % --- Fine Frequency Offset Correction using L-LTF ---
     lltf_coarseCorrected = helperFrequencyOffset( ...
@@ -153,10 +162,14 @@ for p = 1:length(pktStarts)
     % --- Demodulate L-LTF and Estimate CSI ---
     % Demodulation performs FFT and discards the cyclic prefix
     lltf_demod = wlanLLTFDemodulate(lltf_corrected, 'CBW20');
-    chanEst = wlanLLTFChannelEstimate(lltf_demod, 'CBW20');
+    chanEst = wlanLLTFChannelEstimate(lltf_demod, 'CBW20'); % 52 x 1 x numRx
     noiseVarEst = wlanLLTFNoiseEstimate(lltf_demod);
-    snrEst_dB = 10 * log10((mean(abs(chanEst).^2)) / (noiseVarEst + eps));
+    % Per-antenna SNR, and the post-MRC SNR (sum of linear per-antenna SNRs)
+    % that the combined L-SIG/data decoding actually sees.
+    snrPerRx = squeeze(mean(abs(chanEst).^2, 1)).' / (noiseVarEst + eps);
+    snrEst_dB = 10 * log10(sum(snrPerRx));
     packetSnrDb(p) = snrEst_dB;
+    packetSnrPerRxDb(p, :) = 10 * log10(snrPerRx);
     if snrEst_dB < minSnrDb
         packetMacStatus{p} = sprintf('below minimum SNR (%g dB)', minSnrDb);
         continue;
@@ -164,8 +177,8 @@ for p = 1:length(pktStarts)
 
     % Decode L-SIG to estimate the end of this legacy Wi-Fi packet.
     lsigStart = syncStart + 320;
-    if lsigStart + 79 <= length(sig)
-        lsig = sig(lsigStart : lsigStart + 79);
+    if lsigStart + 79 <= nSamples
+        lsig = sig(lsigStart : lsigStart + 79, :);
         lsigCorrected = helperFrequencyOffset( ...
             lsig, -cfoTotal, sampleRate, lsigStart);
         [lsigBits, lsigFail] = wlanLSIGRecover( ...
@@ -189,9 +202,9 @@ for p = 1:length(pktStarts)
                 % as non-HT, so identify them instead of letting them fail
                 % the FCS check.
                 pktFormat = 'unknown';
-                if lsigStart + 239 <= length(sig)
+                if lsigStart + 239 <= nSamples
                     formatSamples = helperFrequencyOffset( ...
-                        sig(lsigStart:lsigStart + 239), -cfoTotal, ...
+                        sig(lsigStart:lsigStart + 239, :), -cfoTotal, ...
                         sampleRate, lsigStart);
                     pktFormat = wlanFormatDetect( ...
                         formatSamples, chanEst, noiseVarEst, 'CBW20');
@@ -208,12 +221,12 @@ for p = 1:length(pktStarts)
                         legacyRatesMbps(rateIdx), requiredSnrDb(rateIdx));
                 elseif psduLength < 10
                     packetMacStatus{p} = 'L-SIG PSDU length is too short for a MAC header';
-                elseif packetEnd > length(sig)
+                elseif packetEnd > nSamples
                     packetMacStatus{p} = sprintf( ...
                         'capture ended before packet data (needs sample %d; capture has %d)', ...
-                        packetEnd - 1, length(sig));
+                        packetEnd - 1, nSamples);
                 else
-                    dataSamples = sig(dataStart:packetEnd-1);
+                    dataSamples = sig(dataStart:packetEnd-1, :);
                     dataCorrected = helperFrequencyOffset( ...
                         dataSamples, -cfoTotal, sampleRate, dataStart);
                     nonHTConfig = wlanNonHTConfig( ...
@@ -245,21 +258,21 @@ for p = 1:length(pktStarts)
         packetMacStatus{p} = 'capture ended before the L-SIG field';
     end
     
-    % chanEst is a 52x1 complex vector: H[k]
+    % chanEst is 52 x 1 x numRx complex: H_r[k] for each antenna
     % --- Extract Power / RSSI Metrics ---
-    % Total packet preamble power (instantaneous power profile)
-    pktPwrLinear = mean(abs(lltf_corrected).^2);
+    % Preamble power averaged over antennas (instantaneous power profile)
+    pktPwrLinear = mean(abs(lltf_corrected).^2, 'all');
     pktPwr_dB = 10 * log10(pktPwrLinear + eps);
     packetPowerDb(p) = pktPwr_dB;
 
-    % Subcarrier-averaged channel power
-    csiPower_dB = 10 * log10(mean(abs(chanEst).^2) + eps);
+    % Subcarrier- and antenna-averaged channel power
+    csiPower_dB = 10 * log10(mean(abs(chanEst).^2, 'all') + eps);
 
-    % Store feature vector
-    csiDataset(end+1, :)   = chanEst.';      % 52 complex subcarrier responses
+    % Store feature vector (per-antenna CSI is kept uncombined for sensing)
+    featureCount = featureCount + 1;
+    csiDataset(featureCount, :, :) = reshape(chanEst, 1, 52, numRx);
     powerDataset(end+1, :) = [pktPwr_dB, csiPower_dB];
     snrDataset(end+1, :)   = snrEst_dB;
-    featureCount = featureCount + 1;
     featureCandidateIds(featureCount) = p;
     featureRouterMacs{featureCount} = packetMacs{p};
     featureCfoHz(featureCount) = cfoTotal;
@@ -268,23 +281,6 @@ packetPlotInfo = packetPlotInfo(1:plotPacketCount, :);
 featureCandidateIds = featureCandidateIds(1:featureCount);
 featureRouterMacs = featureRouterMacs(1:featureCount);
 featureCfoHz = featureCfoHz(1:featureCount);
-
-%% Report BSSIDs and compare them with the MACs printed on the routers
-% The MAC on a router's sticker is usually its Ethernet/base MAC. The BSSID
-% it transmits over the air is derived from it (base + a small offset that
-% differs per band and per SSID, sometimes with the locally administered
-% bit set), so an exact match is not expected.
-routerLabelMacs = {'6C:D6:E3:58:34:4C', '6C:D6:E3:58:43:C4', ...
-    '6C:D6:E3:58:56:68', '6C:D6:E3:58:35:E4', '6C:D6:E3:58:4A:94'}; % from the router stickers
-maxLabelOffset = 64;  % max distance in the low 3 bytes to call a BSSID "related"
-
-[statusNames, ~, statusGroups] = unique(packetMacStatus);
-fprintf('MAC decode summary for %d packet candidates (median L-LTF SNR):\n', ...
-    length(pktStarts));
-for k = 1:length(statusNames)
-    fprintf('  %4d x %-55s %6.1f dB\n', sum(statusGroups == k), ...
-        statusNames{k}, median(packetSnrDb(statusGroups == k), 'omitnan'));
-end
 
 bssidMask = ~strcmp(packetMacs, 'MAC unavailable');
 if any(bssidMask)
@@ -322,7 +318,7 @@ savedRows = find(~strcmp(packetMacs(packetPlotInfo(:, 6)), 'MAC unavailable'));
 packetTemplate = struct('iq', [], 'start_sample', [], 'end_sample', [], ...
     'time_iso', '', 'time_posix', [], 'bssid', '', ...
     'mac_status', '', 'format', '', 'rate_mbps', [], 'psdu_length', [], ...
-    'snr_db', [], 'power_dbfs', [], 'cfo_hz', [], 'noise_var', [], 'csi', []);
+    'snr_db', [], 'snr_per_rx_db', [], 'power_dbfs', [], 'cfo_hz', [], 'noise_var', [], 'csi', []);
 packets = repmat(packetTemplate, length(savedRows), 1);
 for k = 1:length(savedRows)
     row = savedRows(k);
@@ -331,7 +327,7 @@ for k = 1:length(savedRows)
     endSample = packetPlotInfo(row, 5) - 1;
     packetTime = captureStartTime + seconds((startSample - 1) / sampleRate);
 
-    packets(k).iq = sig(startSample:endSample);   % raw, no CFO correction
+    packets(k).iq = sig(startSample:endSample, :);   % raw, no CFO correction
     packets(k).start_sample = startSample;         % index into the capture buffer
     packets(k).end_sample = endSample;
     packets(k).time_iso = char(packetTime, 'yyyy-MM-dd''T''HH:mm:ss.SSSSSSXXX');
@@ -341,11 +337,12 @@ for k = 1:length(savedRows)
     packets(k).format = packetFormat{p};
     packets(k).rate_mbps = packetRateMbps(p);      % from L-SIG (6 for HT/VHT/HE)
     packets(k).psdu_length = packetPsduLength(p);  % bytes, from L-SIG
-    packets(k).snr_db = packetSnrDb(p);
+    packets(k).snr_db = packetSnrDb(p);              % post-MRC (combined)
+    packets(k).snr_per_rx_db = packetSnrPerRxDb(p, :);
     packets(k).power_dbfs = packetPowerDb(p);
     packets(k).cfo_hz = packetCfoHz(p);
     packets(k).noise_var = packetNoiseVar(p);
-    packets(k).csi = csiDataset(featureCandidateIds == p, :).'; % 52x1 L-LTF estimate
+    packets(k).csi = reshape(csiDataset(featureCandidateIds == p, :, :), 52, numRx); % L-LTF estimate per antenna
 end
 
 wifi_data.packets           = packets;
@@ -363,14 +360,13 @@ wifi_data.CaptureTime       = CaptureTime;
 wifi_data.gain_db           = rxGain;
 wifi_data.sdr_serial        = sdrSerial;
 wifi_data.antenna_port      = antennaPort;
+wifi_data.num_rx            = numRx;
 wifi_data.overrun           = logical(overrun);
 wifi_data.min_snr_db        = minSnrDb;
 wifi_data.num_candidates    = length(pktStarts);
 wifi_data.router_label_macs = routerLabelMacs;
 wifi_data.matlab_version    = version;
-if saveFullCapture
-    wifi_data.full_iq = sig;
-end
+wifi_data.raw_file          = rawFile;     % full buffer lives there
 
 if isempty(packets)
     fprintf('No packets with a recovered BSSID; nothing saved.\n');
@@ -388,7 +384,7 @@ else
 end
 
 %% Raw I/Q waveform with packet-field markers
-t = (0:length(sig)-1) / sampleRate;
+t = (0:nSamples-1) / sampleRate;
 if ~isempty(packetPlotInfo)
     firstPacketSamples = packetPlotInfo(1, 5) - packetPlotInfo(1, 1);
     firstPacketDurationMs = firstPacketSamples / sampleRate * 1e3;
@@ -419,14 +415,14 @@ end
 if ~isempty(packetPlotInfo)
     packetStart = max(1, packetPlotInfo(1, 1));
     packetEndBoundary = packetPlotInfo(1, 5);
-    packetEnd = min(length(sig), packetEndBoundary - 1);
+    packetEnd = min(nSamples, packetEndBoundary - 1);
     timeRange = packetStart:packetEnd;
     packetStartTimeMs = (packetStart - 1) / sampleRate * 1e3;
     packetEndTimeMs = (packetEndBoundary - 1) / sampleRate * 1e3;
-    captureEndTimeMs = length(sig) / sampleRate * 1e3;
+    captureEndTimeMs = nSamples / sampleRate * 1e3;
 
     figure('Color', 'w');
-    plot(t(timeRange) * 1e3, abs(sig(timeRange)));
+    plot(t(timeRange) * 1e3, abs(sig(timeRange, :)));
     firstCandidateId = packetPlotInfo(1, 6);
     title(sprintf('Packet %d from %s (%.3f ms)', firstCandidateId, ...
         packetMacs{firstCandidateId}, firstPacketDurationMs));
@@ -458,10 +454,10 @@ if ~isempty(packetPlotInfo)
             'Color', [0.85 0.1 0.1]);
     end
 
-    headerEnd = min(length(sig), packetPlotInfo(1, 4) + 159);
+    headerEnd = min(nSamples, packetPlotInfo(1, 4) + 159);
     headerRange = packetStart:headerEnd;
     figure('Color', 'w');
-    plot(t(headerRange) * 1e3, abs(sig(headerRange)));
+    plot(t(headerRange) * 1e3, abs(sig(headerRange, :)));
     title(sprintf('Preamble and Header - Packet %d from %s', ...
         firstCandidateId, packetMacs{firstCandidateId}));
     xlabel('Time (ms)');
@@ -480,12 +476,14 @@ end
 
 %% 3. Visualization (one figure per plot, sized for slides)
 if ~isempty(csiDataset)
+    % CSI-shape plots use antenna 1; the per-antenna CSI is saved for all.
+    csiPlot = csiDataset(:, :, 1);
     subcarrierIdx = [-26:-1, 1:26];
-    nFeatures = size(csiDataset, 1);
+    nFeatures = size(csiPlot, 1);
     [routerLabels, ~, routerGroup] = unique(featureRouterMacs);
     % Fixed color order; routers past the sixth share gray.
-    palette = [0x2a 0x78 0xd6; 0xeb 0x68 0x34; 0x1b 0xaf 0x7a; ...
-               0xed 0xa1 0x00; 0xe8 0x7b 0xa4; 0x00 0x83 0x00] / 255;
+    palette = double([0x2a 0x78 0xd6; 0xeb 0x68 0x34; 0x1b 0xaf 0x7a; ...
+               0xed 0xa1 0x00; 0xe8 0x7b 0xa4; 0x00 0x83 0x00]) / 255;
     routerColors = repmat([0.6 0.6 0.6], length(routerLabels), 1);
     nColored = min(6, length(routerLabels));
     routerColors(1:nColored, :) = palette(1:nColored, :);
@@ -493,7 +491,7 @@ if ~isempty(csiDataset)
 
     % Phase with the linear term (timing offset) and constant term
     % (residual CFO) removed, leaving the channel's own phase shape.
-    csiPhase = unwrap(angle(csiDataset), [], 2);
+    csiPhase = unwrap(angle(csiPlot), [], 2);
     for packetIdx = 1:nFeatures
         coeffs = polyfit(subcarrierIdx, csiPhase(packetIdx, :), 1);
         csiPhase(packetIdx, :) = csiPhase(packetIdx, :) - ...
@@ -509,7 +507,7 @@ if ~isempty(csiDataset)
     pdpDb = zeros(nFeatures, nfft);
     for packetIdx = 1:nFeatures
         H = zeros(nfft, 1);
-        H(mod(subcarrierIdx, nfft) + 1) = csiDataset(packetIdx, :);
+        H(mod(subcarrierIdx, nfft) + 1) = csiPlot(packetIdx, :);
         h = ifft(H);
         [~, peakIdx] = max(abs(h));
         h = circshift(h, leadSamples - (peakIdx - 1));
@@ -521,9 +519,9 @@ if ~isempty(csiDataset)
     % CSI magnitude
     figure('Color', 'w', 'Position', slideSize);
     ax = gca; hold(ax, 'on');
-    helperPlotByRouter(ax, subcarrierIdx, abs(csiDataset), routerGroup, ...
+    helperPlotByRouter(ax, subcarrierIdx, abs(csiPlot), routerGroup, ...
         routerLabels, routerColors);
-    title(ax, 'CSI Magnitude |H[k]| (L-LTF)');
+    title(ax, 'CSI Magnitude |H[k]| (L-LTF, RX 1)');
     xlabel(ax, 'Subcarrier Index'); ylabel(ax, '|H|');
     helperStyleSlideAxes(ax);
 
@@ -589,12 +587,12 @@ if ~isempty(csiDataset)
     % CSI magnitude heatmap, packets in capture order
     figure('Color', 'w', 'Position', slideSize);
     ax = gca;
-    imagesc(ax, subcarrierIdx, 1:nFeatures, 20 * log10(abs(csiDataset) + eps));
-    blueRamp = [0xcd 0xe2 0xfb; 0x9e 0xc5 0xf4; 0x6d 0xa7 0xec; 0x39 0x87 0xe5; ...
-                0x25 0x6a 0xbf; 0x18 0x4f 0x95; 0x0d 0x36 0x6b] / 255;
+    imagesc(ax, subcarrierIdx, 1:nFeatures, 20 * log10(abs(csiPlot) + eps));
+    blueRamp = double([0xcd 0xe2 0xfb; 0x9e 0xc5 0xf4; 0x6d 0xa7 0xec; 0x39 0x87 0xe5; ...
+                0x25 0x6a 0xbf; 0x18 0x4f 0x95; 0x0d 0x36 0x6b]) / 255;
     colormap(ax, interp1(linspace(0, 1, 7), blueRamp, linspace(0, 1, 256)));
     cb = colorbar(ax); cb.Label.String = '|H| (dB)';
-    title(ax, 'CSI Magnitude, All Packets');
+    title(ax, 'CSI Magnitude, All Packets (RX 1)');
     xlabel(ax, 'Subcarrier Index'); ylabel(ax, 'Packet (capture order)');
     ax.FontSize = 16; ax.TitleFontSizeMultiplier = 1.2;
 end
