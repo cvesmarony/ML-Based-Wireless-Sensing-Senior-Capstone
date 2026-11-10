@@ -295,8 +295,7 @@ if any(bssidMask)
         bssid = distinctBssids{rankedGroups(rank)};
         candidateIds = find(strcmp(packetMacs, bssid));
         fprintf('%d. %s (peak power %.2f dB; %d packet(s)) %s\n', ...
-            rank, bssid, rankedPeakPowers(rank), length(candidateIds), ...
-            helperMatchLabelMac(bssid, routerLabelMacs, maxLabelOffset));
+            rank, bssid, rankedPeakPowers(rank), length(candidateIds));
         for candidateIdx = 1:length(candidateIds)
             candidateId = candidateIds(candidateIdx);
             fprintf('   Candidate %d: %.2f dB (%s).\n', ...
@@ -364,7 +363,7 @@ wifi_data.num_rx            = numRx;
 wifi_data.overrun           = logical(overrun);
 wifi_data.min_snr_db        = minSnrDb;
 wifi_data.num_candidates    = length(pktStarts);
-wifi_data.router_label_macs = routerLabelMacs;
+% wifi_data.router_label_macs = routerLabelMacs;
 wifi_data.matlab_version    = version;
 wifi_data.raw_file          = rawFile;     % full buffer lives there
 
