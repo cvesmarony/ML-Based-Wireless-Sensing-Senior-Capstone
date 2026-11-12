@@ -71,7 +71,7 @@ bits_S90 = sounding_bits_S90(1:1024);
 syms_S0 = sounding_syms_S0(1:512);
 syms_S90 = sounding_syms_S90(1:512);
 
-% save('waveform_STTD.mat', 'waveform_S1', 'waveform_S2', 'bits_S1', 'bits_S2', 'syms_S1', 'syms_S2');
+save('waveform_STTD.mat', 'waveform_S0', 'waveform_S90', 'bits_S0', 'bits_S90', 'syms_S0', 'syms_S90');
 
 %% 4. TWO-ANTENNA BEAMFORMING
 % Creates a 0 deg beam and 90 deg beam using the same initial signal S
