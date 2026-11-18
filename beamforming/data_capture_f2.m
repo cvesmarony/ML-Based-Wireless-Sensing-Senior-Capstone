@@ -1,29 +1,29 @@
 clear;
 
 % Adjust to match RX position
-x_lab = 0;
-y_lab = 0;
-orientation = 0;
+x_lab = 0; % 0 to 15
+y_lab = 11; % 0 to 11
+orientation = 0; % 0 or 90
 
 disp(string(x_lab) + " " + string(y_lab) + " " + string(orientation));
 
 % Adjust to match TX position, ALSO UPDATE THE FILENAME TO TX#
 
-% tx_num = 1;
-% tx_pos = [-1, 10, 0.875];
+tx_num = 1;
+tx_pos = [11, 15, 0.875];
 
-tx_num = 2;
-tx_pos = [13, 8, 0.875];
+% tx_num = 2;
+% tx_pos = [1, 8, 0.875];
 
 %tx_num = 3;
-%tx_pos = [6, 5, 1.021];
+%tx_pos = [8, 5, 1.021];
 
 if x_lab == round(x_lab) && y_lab == round(y_lab)
-    data_folder = "data_f2/";
+    data_folder = "mimo_data/";
 elseif x_lab == round(x_lab) || y_lab == round(y_lab)
     disp("Something is mismatched check x y")
 else
-    data_folder = "test_data_f2/";
+    data_folder = "mimo_test_data/";
 end
 
 
