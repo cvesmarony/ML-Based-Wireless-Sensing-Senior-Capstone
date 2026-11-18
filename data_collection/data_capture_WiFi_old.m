@@ -16,7 +16,7 @@ TotalSamples = round(sampleRate * CaptureTime);
 channel      = 6;
 centerFreq   = 2407e6 + 5e6 * channel;
 rxGain       = 76;
-sdrSerial    = '3839223';                  % check with "findsdru"
+sdrSerial    = '3839244';                  % check with "findsdru"
 antennaPort  = 'RX2';
 
 % Packets below minSnrDb are dropped before decoding (even the 6 Mb/s L-SIG

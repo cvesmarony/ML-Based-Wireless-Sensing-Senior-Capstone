@@ -9,7 +9,7 @@ function [iq, overrun] = captureB210(sdrSerial, centerFreq, sampleRate, ...
 % drain the USB stream fast enough, so only the first few ms arrive and the
 % rest of the buffer is zeros. Burst mode instead has the driver buffer
 % numFrames contiguous 1 ms frames, which are then read out one at a time.
-frameLen  = round(sampleRate * 1e-3);
+frameLen  = round(sampleRate * captureSec);
 numFrames = ceil(captureSec * sampleRate / frameLen);
 channel = 6;
 
@@ -23,12 +23,12 @@ rxObj = comm.SDRuReceiver( ...
     'ChannelMapping',     1:numRx, ...
     'ReceiveAntennaPort', 'RX2', ...
     'Gain',               repmat(rxGain, 1, numRx), ...
-    'OutputDataType',     'single', ...
+    'OutputDataType',     'double', ...
     'EnableBurstMode',    true, ...
     'NumFramesInBurst',   numFrames);
 cleanup = onCleanup(@() release(rxObj));
 
-iq = complex(zeros(numFrames * frameLen, numRx, 'int16'));
+iq = [];        % allocated on the first frame with the radio's output type
 overrun = false;
 for k = 1:numFrames
     len = 0;
@@ -44,6 +44,12 @@ for k = 1:numFrames
             end
             rethrow(err);
         end
+    end
+    if isempty(iq)
+        % Same type as the frames (int16, single or double): preallocating
+        % int16 and writing +/-1-scaled single/double frames into it rounds
+        % every sample to 0, which then looks exactly like dropped samples.
+        iq = zeros(numFrames * frameLen, numRx, 'like', frame);
     end
     iq((k - 1) * frameLen + (1:frameLen), :) = frame;
     overrun = overrun || frameOverrun;

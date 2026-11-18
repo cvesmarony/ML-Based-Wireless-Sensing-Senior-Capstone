@@ -15,21 +15,20 @@ clear;
 % wifi_capture_raw.m (e.g. 'wifi_raw/raw_ch6_0_0_0_20261110_163914.mat') to
 % analyse that capture; the radio settings below are then read from the file.
 sourceFile  = '';
-captureMs   = 10;              % how long to listen (ms)
+captureMs   = 100;              % how long to listen (ms)
 % B210 sample rate (= MasterClockRate, no decimation). At 20 MS/s the
 % Nyquist edges sit exactly on the 20 MHz channel edges, so nothing outside
 % the channel is visible. A higher rate (e.g. 25e6, or up to 30.72e6 with 2
 % antennas) shows the band edges and the receive filter roll-off. The
 % decoder always runs at 20 MS/s; other rates are resampled for decoding.
 sampleRate  = 20e6;
+TotalSamples = round(sampleRate * captureMs*1000)
 channel     = 6;
 centerFreq  = 2407e6 + 5e6 * channel;
-rxGain      = 45;               % dB, same on all channels
+rxGain      = 25;               % dB, same on all channels
 sdrSerial   = '3839244';        % check with "findsdru"
 antennaPort = 'RX2';
-% 1 or 2. 2 antennas at 20 MS/s overflowed this laptop's USB link for long
-% captures; for the 2-antenna check try a shorter captureMs (e.g. 10).
-numRx       = 2;
+numRx       = 1;
 
 % Below minSnrDb even the most robust part of a packet (the 6 Mb/s L-SIG
 % header) cannot be decoded. requiredSnrDb is the approximate SNR each
