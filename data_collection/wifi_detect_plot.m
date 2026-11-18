@@ -1,20 +1,35 @@
 clear;
-% Configures the B210, listens for captureMs milliseconds on both antennas,
-% runs EVERY detected packet candidate through the Wi-Fi decoder, prints
-% where each candidate ended up and why (with the evidence), and plots
-% |IQ| vs time with a line where each real packet begins and ends.
-% Nothing is saved. Decoding follows data_capture_WiFi.m (MRC over both
-% antennas).
+% Configures the B210 (or loads a wifi_capture_raw.m file), listens for
+% captureMs milliseconds, runs EVERY detected packet candidate through the
+% Wi-Fi decoder, prints where each candidate ended up and why (with the
+% evidence), and plots:
+%   1. |IQ| vs time with a line where each real packet begins and ends
+%   2. raw I/Q power spectrum per antenna (whole capture and packets only)
+%   3. L-LTF magnitude over all 64 subcarrier bins per antenna
+% Figures 2 and 3 are the sample-rate / bandwidth / antenna check to run
+% before a full measurement. Nothing is saved. Decoding follows
+% data_capture_WiFi.m (MRC over the antennas).
 
 %% Configuration
-captureMs   = 100;              % how long to listen (ms)
+% Leave sourceFile empty to capture live, or set it to a file saved by
+% wifi_capture_raw.m (e.g. 'wifi_raw/raw_ch6_0_0_0_20261110_163914.mat') to
+% analyse that capture; the radio settings below are then read from the file.
+sourceFile  = '';
+captureMs   = 10;              % how long to listen (ms)
+% B210 sample rate (= MasterClockRate, no decimation). At 20 MS/s the
+% Nyquist edges sit exactly on the 20 MHz channel edges, so nothing outside
+% the channel is visible. A higher rate (e.g. 25e6, or up to 30.72e6 with 2
+% antennas) shows the band edges and the receive filter roll-off. The
+% decoder always runs at 20 MS/s; other rates are resampled for decoding.
 sampleRate  = 20e6;
 channel     = 6;
 centerFreq  = 2407e6 + 5e6 * channel;
-rxGain      = 45;               % dB, same on both channels
-sdrSerial   = '3839223';        % check with "findsdru"
+rxGain      = 45;               % dB, same on all channels
+sdrSerial   = '3839244';        % check with "findsdru"
 antennaPort = 'RX2';
-numRx       = 1;                % 2 antennas at 20 MS/s overflows this laptop's USB link
+% 1 or 2. 2 antennas at 20 MS/s overflowed this laptop's USB link for long
+% captures; for the 2-antenna check try a shorter captureMs (e.g. 10).
+numRx       = 2;
 
 % Below minSnrDb even the most robust part of a packet (the 6 Mb/s L-SIG
 % header) cannot be decoded. requiredSnrDb is the approximate SNR each
@@ -24,21 +39,48 @@ minSnrDb        = 5;
 legacyRatesMbps = [6 9 12 18 24 36 48 54];
 requiredSnrDb   = [5 7 8 11 14 17 21 23];
 
-%% Capture
-fprintf('Capturing %g ms on %d antennas, channel %d (%.0f MHz)...\n', ...
-    captureMs, numRx, channel, centerFreq / 1e6);
-[sig, overrun] = captureB210(sdrSerial, centerFreq, sampleRate, rxGain, ...
-    antennaPort, numRx, captureMs / 1e3);     % [nSamples x numRx]
-if overrun
-    warning('Buffer overrun detected. Some samples may be dropped.');
+%% Capture (or load)
+if isempty(sourceFile)
+    fprintf('Capturing %g ms on %d antennas, channel %d (%.0f MHz), %g MS/s...\n', ...
+        captureMs, numRx, channel, centerFreq / 1e6, sampleRate / 1e6);
+    [sigRaw, overrun] = captureB210(sdrSerial, centerFreq, sampleRate, rxGain, ...
+        antennaPort, numRx, captureMs / 1e3);     % [nSamples x numRx]
+    if overrun
+        warning('Buffer overrun detected. Some samples may be dropped.');
+    end
+else
+    S = load(sourceFile, 'raw_wifi');
+    sigRaw     = S.raw_wifi.iq;
+    sampleRate = S.raw_wifi.Fs;
+    channel    = S.raw_wifi.channel;
+    centerFreq = S.raw_wifi.freq;
+    rxGain     = S.raw_wifi.gain_db;
+    numRx      = size(sigRaw, 2);
+    fprintf('Loaded %s: %d antenna(s), channel %d, %g MS/s, gain %g dB\n', ...
+        sourceFile, numRx, channel, sampleRate / 1e6, rxGain);
 end
-nSamples = size(sig, 1);
+% captureB210 and new saved files are int16; scale to doubles in +/-1.
+if isinteger(sigRaw)
+    sigRaw = double(sigRaw) / 32768;
+end
+captureMs = size(sigRaw, 1) / sampleRate * 1e3;
 % The ADC saturates at |I| or |Q| = 1; clipped samples corrupt packets.
-isClipped = any(abs(real(sig)) >= 0.999 | abs(imag(sig)) >= 0.999, 2);
+isClipped = any(abs(real(sigRaw)) >= 0.999 | abs(imag(sigRaw)) >= 0.999, 2);
 if any(isClipped)
     warning(['%d samples are clipped at ADC full scale: lower rxGain ' ...
         '(currently %g dB).'], sum(isClipped), rxGain);
 end
+
+% The decoder works at the 20 MS/s Wi-Fi rate. sigRaw stays at the capture
+% rate for the raw spectrum.
+wifiFs = 20e6;
+sig = sigRaw;
+if sampleRate ~= wifiFs
+    [up, down] = rat(wifiFs / sampleRate);
+    sig = resample(sigRaw, up, down);
+    isClipped = isClipped(min(end, round((0:size(sig, 1) - 1)' * sampleRate / wifiFs) + 1));
+end
+nSamples = size(sig, 1);
 
 %% Packet detection
 % wlanPacketDetect flags anything whose autocorrelation looks like the
@@ -70,8 +112,10 @@ reason     = repmat({''}, nCand, 1);
 packetMac  = repmat({'MAC unavailable'}, nCand, 1);
 snrDb      = NaN(nCand, 1);          % post-MRC L-LTF SNR
 pktBounds  = NaN(nCand, 2);          % [first sample, one past last sample]
-candMs     = (pktStarts - 1) / sampleRate * 1e3;
+candMs     = (pktStarts - 1) / wifiFs * 1e3;
 hostPacket = zeros(nCand, 1);        % for re-triggers: packet they fall in
+lltfSpec   = zeros(64, numRx, 0);    % L-LTF FFT [bin x antenna x packet]
+lltfPkt    = zeros(0, 1);            % candidate number of each lltfSpec page
 
 previousPacketEnd = 0;
 previousPacketId  = 0;
@@ -94,7 +138,7 @@ for p = 1:nCand
     % Coarse CFO (L-STF), fine timing
     preamble = sig(pktStart:pktStart + 400, :);
     cfoCoarse = wlanCoarseCFOEstimate(preamble(1:160, :), 'CBW20');
-    preambleCorr = helperFrequencyOffset(preamble, -cfoCoarse, sampleRate, pktStart);
+    preambleCorr = helperFrequencyOffset(preamble, -cfoCoarse, wifiFs, pktStart);
     syncStart = pktStart + wlanSymbolTimingEstimate(preambleCorr, 'CBW20');
     if syncStart < 1 || syncStart + 399 > nSamples
         category(p) = CUT_OFF;
@@ -106,10 +150,10 @@ for p = 1:nCand
     lltfStart = syncStart + 160;
     lltfRaw = sig(lltfStart:lltfStart + 159, :);
     cfoFine = wlanFineCFOEstimate( ...
-        helperFrequencyOffset(lltfRaw, -cfoCoarse, sampleRate, lltfStart), 'CBW20');
+        helperFrequencyOffset(lltfRaw, -cfoCoarse, wifiFs, lltfStart), 'CBW20');
     cfoTotal = cfoCoarse + cfoFine;
-    lltfDemod = wlanLLTFDemodulate( ...
-        helperFrequencyOffset(lltfRaw, -cfoTotal, sampleRate, lltfStart), 'CBW20');
+    lltfCorr = helperFrequencyOffset(lltfRaw, -cfoTotal, wifiFs, lltfStart);
+    lltfDemod = wlanLLTFDemodulate(lltfCorr, 'CBW20');
     chanEst = wlanLLTFChannelEstimate(lltfDemod, 'CBW20');
     noiseVar = wlanLLTFNoiseEstimate(lltfDemod);
     snrPerRx = squeeze(mean(abs(chanEst).^2, 1)).' / (noiseVar + eps);
@@ -122,7 +166,7 @@ for p = 1:nCand
     % L-SIG header (always 6 Mb/s): rate and length of the payload
     lsigStart = syncStart + 320;
     lsig = helperFrequencyOffset(sig(lsigStart:lsigStart + 79, :), ...
-        -cfoTotal, sampleRate, lsigStart);
+        -cfoTotal, wifiFs, lsigStart);
     [lsigBits, lsigFail] = wlanLSIGRecover(lsig, chanEst, noiseVar, 'CBW20');
     if lsigFail
         category(p) = BAD_HEADER;
@@ -154,7 +198,7 @@ for p = 1:nCand
     pktFormat = 'unknown';
     if lsigStart + 239 <= nSamples
         pktFormat = wlanFormatDetect(helperFrequencyOffset( ...
-            sig(lsigStart:lsigStart + 239, :), -cfoTotal, sampleRate, lsigStart), ...
+            sig(lsigStart:lsigStart + 239, :), -cfoTotal, wifiFs, lsigStart), ...
             chanEst, noiseVar, 'CBW20');
     end
     if strcmp(pktFormat, 'HT-GF')
@@ -170,6 +214,9 @@ for p = 1:nCand
     end
     previousPacketEnd = packetEnd;
     previousPacketId = p;
+    % Valid header -> real packet: keep its L-LTF spectrum for the BW plot.
+    lltfSpec(:, :, end + 1) = helperLltfSpectrum(lltfCorr); %#ok<SAGROW>
+    lltfPkt(end + 1, 1) = p; %#ok<SAGROW>
     headerText = sprintf('%s, %d Mb/s, %d B, SNR %.1f dB', ...
         pktFormat, rateMbps, psduLength, snrDb(p));
 
@@ -186,7 +233,7 @@ for p = 1:nCand
         % (FCS) at the end of the frame decides whether the bits are right.
         dataStart = syncStart + 400;
         dataCorr = helperFrequencyOffset(sig(dataStart:packetEnd - 1, :), ...
-            -cfoTotal, sampleRate, dataStart);
+            -cfoTotal, wifiFs, dataStart);
         cfg = wlanNonHTConfig('ChannelBandwidth', 'CBW20', ...
             'MCS', rateIdx - 1, 'PSDULength', psduLength);
         psduBits = wlanNonHTDataRecover(dataCorr, chanEst, noiseVar, cfg);
@@ -271,7 +318,7 @@ for c = 1:numel(catTitle)
             for h = hosts'
                 n = sum(hostPacket(rows) == h);
                 fprintf('    %3d re-trigger(s) inside #%d (%.3f-%.3f ms, %s)\n', ...
-                    n, h, (pktBounds(h, :) - 1) / sampleRate * 1e3, ...
+                    n, h, (pktBounds(h, :) - 1) / wifiFs * 1e3, ...
                     catTitle{category(h)}(1:find(catTitle{category(h)} == ':', 1) - 1));
             end
         case LOW_SNR
@@ -299,7 +346,7 @@ fprintf('%s\n', rule);
 % Only real packets (decoded or not) get lines; false alarms do not. Start
 % lines carry the candidate number (and MAC if decoded) so they can be
 % matched to the report; zoom in to separate packets close together.
-t = (0:nSamples - 1) / sampleRate * 1e3;
+t = (0:nSamples - 1) / wifiFs * 1e3;
 green = [0 0.6 0.2];  orange = [0.93 0.55 0];  red = [0.85 0.1 0.1];
 figure('Color', 'w', 'Position', [100 100 1400 600]);
 hold on; grid on;
@@ -315,7 +362,7 @@ legend([arrayfun(@(r) sprintf('RX %d', r), 1:numRx, 'UniformOutput', false), ...
     {'Start: decoded', 'Start: real, not decoded', 'Packet end'}], ...
     'Location', 'northeastoutside');
 for p = find(category <= CUT_OFF & ~isnan(pktBounds(:, 1)))'
-    startMs = (pktBounds(p, 1) - 1) / sampleRate * 1e3;
+    startMs = (pktBounds(p, 1) - 1) / wifiFs * 1e3;
     if category(p) == DECODED_MAC
         xline(startMs, '-', sprintf('#%d %s', p, packetMac{p}), ...
             'Color', green, 'LineWidth', 1.5, 'HandleVisibility', 'off');
@@ -327,7 +374,7 @@ for p = find(category <= CUT_OFF & ~isnan(pktBounds(:, 1)))'
             'Color', orange, 'LineWidth', 1.2, 'HandleVisibility', 'off');
     end
     if pktBounds(p, 2) <= nSamples
-        xline((pktBounds(p, 2) - 1) / sampleRate * 1e3, ':', ...
+        xline((pktBounds(p, 2) - 1) / wifiFs * 1e3, ':', ...
             'Color', red, 'LineWidth', 1.2, 'HandleVisibility', 'off');
     end
 end
@@ -337,7 +384,116 @@ xlabel('Time (ms)');
 ylabel('|IQ|');
 xlim([0 t(end)]);
 
+%% Plot: raw I/Q power spectrum per antenna
+% Welch PSD at the capture rate (before resampling). "Packets only" uses
+% the samples inside real packets, so it shows the Wi-Fi signal's own shape
+% instead of being dominated by the noise between packets. The dashed lines
+% are the outermost occupied subcarriers (+/-26 x 312.5 kHz = +/-8.125 MHz),
+% the dotted lines the 20 MHz channel edges.
+nfft = 1024;
+inPkt = false(size(sigRaw, 1), 1);
+for p = find(category <= CUT_OFF & ~isnan(pktBounds(:, 1)))'
+    b = round((pktBounds(p, :) - 1) * sampleRate / wifiFs) + 1;
+    inPkt(b(1):min(b(2) - 1, end)) = true;
+end
+% Rows of exact zeros are samples the B210 dropped (USB overflow); leave
+% them out so they do not pull the noise floor down.
+dropped = all(sigRaw == 0, 2);
+if mean(dropped) > 0.01
+    fprintf('Note: %.0f%% of this capture is dropped samples (zeros).\n', 100 * mean(dropped));
+end
+[psdAll, f] = pwelch(sigRaw(~dropped, :), hann(nfft), nfft / 2, nfft, sampleRate, 'centered');
+havePkt = sum(inPkt) >= nfft;
+if havePkt
+    psdPkt = pwelch(sigRaw(inPkt, :), hann(nfft), nfft / 2, nfft, sampleRate, 'centered');
+end
+
+fprintf('\nSPECTRUM CHECK: %g MS/s, %d antenna(s), %.2f ms of packet samples\n', ...
+    sampleRate / 1e6, numRx, sum(inPkt) / sampleRate * 1e3);
+fprintf('  Expected 802.11a/g occupied bandwidth ~16.6 MHz (52 subcarriers + DC).\n');
+figure('Color', 'w', 'Position', [120 120 1000 300 * numRx]);
+for r = 1:numRx
+    subplot(numRx, 1, r); hold on; grid on;
+    plot(f / 1e6, 10 * log10(psdAll(:, r)), 'Color', [0.6 0.6 0.6]);
+    legendText = {'Whole capture'};
+    if havePkt
+        plot(f / 1e6, 10 * log10(psdPkt(:, r)), 'Color', [0 0.35 0.8]);
+        legendText{end + 1} = 'Packets only'; %#ok<SAGROW>
+        % 99% occupied bandwidth of the packet samples
+        c = cumsum(psdPkt(:, r)) / sum(psdPkt(:, r));
+        bw99 = f(find(c >= 0.995, 1)) - f(find(c >= 0.005, 1));
+        fprintf('  RX %d: 99%% occupied bandwidth of packet samples = %.2f MHz\n', ...
+            r, bw99 / 1e6);
+    end
+    xline([-8.125 8.125], '--', 'Color', [0.85 0.1 0.1], 'HandleVisibility', 'off');
+    xline([-10 10], ':', 'Color', [0 0 0], 'HandleVisibility', 'off');
+    legend(legendText, 'Location', 'southwest');
+    xlim([-1 1] * sampleRate / 2e6);
+    xlabel(sprintf('Frequency offset from %.0f MHz (MHz)', centerFreq / 1e6));
+    ylabel('PSD (dB/Hz, rel. full scale)');
+    title(sprintf('Raw I/Q spectrum, RX %d - %g MS/s, gain %g dB', ...
+        r, sampleRate / 1e6, rxGain));
+end
+
+%% Plot: L-LTF magnitude over the 64 subcarrier bins per antenna
+% 64-point FFT of each real packet's (CFO-corrected) L-LTF. The L-LTF has
+% equal power on all 52 occupied subcarriers (-26..26, DC empty), so the
+% occupied bins should sit near 0 dB and the 11 guard bins plus DC at the
+% noise floor. Each packet is normalised to its mean occupied-bin power so
+% packets from different transmitters overlay; the thick line is the median.
+% Edge roll-off well below 0 dB means the receive filter is cutting the
+% outer subcarriers, i.e. the sample rate / analog bandwidth is too narrow.
+nPkt = size(lltfSpec, 3);
+if nPkt == 0
+    fprintf('  No real packets: no L-LTF spectrum to plot.\n');
+else
+    bins = (-32:31)';
+    occupied = abs(bins) >= 1 & abs(bins) <= 26;
+    edgeBins = abs(bins) >= 24 & abs(bins) <= 26;
+    innerBins = abs(bins) >= 1 & abs(bins) <= 23;
+    guardBins = abs(bins) >= 27;
+    figure('Color', 'w', 'Position', [140 140 1000 300 * numRx]);
+    for r = 1:numRx
+        pw = squeeze(abs(lltfSpec(:, r, :)).^2);            % [64 x nPkt]
+        pw = reshape(pw, 64, nPkt);
+        pwDb = 10 * log10(pw ./ mean(pw(occupied, :), 1) + eps);
+        subplot(numRx, 1, r); hold on; grid on;
+        stairs([bins - 0.5; 31.5], [pwDb; pwDb(end, :)], 'Color', [0.7 0.75 0.9], 'HandleVisibility', 'off');
+        stairs([bins - 0.5; 31.5], median([pwDb; pwDb(end, :)], 2), 'Color', [0 0.25 0.7], 'LineWidth', 2);
+        xline([-26.5 26.5], '--', 'Color', [0.85 0.1 0.1], 'HandleVisibility', 'off');
+        xlim([-32.5 31.5]);
+        ylim([max(-40, min(median(pwDb, 2)) - 5), 10]);
+        xlabel('Subcarrier index (x 312.5 kHz)');
+        ylabel('|L-LTF|^2 (dB, rel. occupied mean)');
+        title(sprintf('L-LTF spectrum, RX %d - %d real packets', r, nPkt));
+        legend('Median over packets', 'Location', 'south');
+
+        edgeDb  = median(10 * log10(mean(pw(edgeBins, :), 1) ./ mean(pw(innerBins, :), 1)));
+        guardDb = median(10 * log10(mean(pw(guardBins, :), 1) ./ mean(pw(occupied, :), 1)));
+        fprintf(['  RX %d L-LTF: edge subcarriers |k|=24..26 are %+.1f dB vs inner ' ...
+            '(0 = flat); guard bins are %.1f dB below occupied\n'], r, edgeDb, -guardDb);
+    end
+    if numRx > 1
+        % Power ratio per packet between the antennas: both chains should
+        % see the same packets at comparable levels.
+        p1 = squeeze(mean(abs(lltfSpec(occupied, 1, :)).^2, 1));
+        p2 = squeeze(mean(abs(lltfSpec(occupied, 2, :)).^2, 1));
+        fprintf('  RX2 vs RX1 L-LTF power: median %+.1f dB (range %+.1f to %+.1f)\n', ...
+            median(10 * log10(p2 ./ p1)), min(10 * log10(p2 ./ p1)), ...
+            max(10 * log10(p2 ./ p1)));
+    end
+end
+
 %% Helpers
+% 64-bin spectrum (bins -32..31) of the L-LTF's two identical symbols,
+% averaged. lltf is the 160-sample field (32 guard + 2 x 64). The FFT window
+% starts 8 samples early, inside the guard interval, so a slightly late
+% timing estimate does not pull in the next field; that only adds a linear
+% phase, which does not change magnitudes.
+function X = helperLltfSpectrum(lltf)
+    X = fftshift((fft(lltf(25:88, :)) + fft(lltf(89:152, :))) / 2, 1);
+end
+
 function out = helperFrequencyOffset(in, fOffset, fs, startSample)
     t = (startSample - 1 + (0:size(in, 1) - 1).') / fs;
     out = in .* exp(1j * 2 * pi * fOffset * t);

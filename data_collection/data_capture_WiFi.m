@@ -34,7 +34,10 @@ end
 fprintf('Loading %s\n', rawFile);
 raw_wifi = load(rawFile).raw_wifi;
 
-rxBuffer     = raw_wifi.iq;
+rxBuffer     = double(raw_wifi.iq);   % int16 captures: scale to +/-1
+if isinteger(raw_wifi.iq)
+    rxBuffer = rxBuffer / 32768;
+end
 sampleRate   = raw_wifi.Fs;
 CaptureTime  = raw_wifi.CaptureTime;
 channel      = raw_wifi.channel;
