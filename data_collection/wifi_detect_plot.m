@@ -21,14 +21,14 @@ captureMs   = 100;              % how long to listen (ms)
 % the channel is visible. A higher rate (e.g. 25e6, or up to 30.72e6 with 2
 % antennas) shows the band edges and the receive filter roll-off. The
 % decoder always runs at 20 MS/s; other rates are resampled for decoding.
-sampleRate  = 20e6;
+sampleRate  = 11e6;
 TotalSamples = round(sampleRate * captureMs*1000)
 channel     = 6;
 centerFreq  = 2407e6 + 5e6 * channel;
 rxGain      = 25;               % dB, same on all channels
 sdrSerial   = '3839244';        % check with "findsdru"
 antennaPort = 'RX2';
-numRx       = 1;
+numRx       = 2;
 
 % Below minSnrDb even the most robust part of a packet (the 6 Mb/s L-SIG
 % header) cannot be decoded. requiredSnrDb is the approximate SNR each
