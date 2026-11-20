@@ -1,8 +1,8 @@
 clear;
 
 % Adjust to match RX position
-x_lab = 0; % 0 to 15
-y_lab = 10; % 0 to 11
+x_lab = 6; % 0 to 15
+y_lab = 11; % 0 to 11
 orientation = 135; % 0, 45, 90, 135
 
 disp(string(x_lab) + " " + string(y_lab) + " " + string(orientation));
