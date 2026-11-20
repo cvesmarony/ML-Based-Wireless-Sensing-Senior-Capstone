@@ -1,52 +1,45 @@
-clear;
+%% DATA CAPTURE
+% Requires initialize_rx.m to have already been run.
+
+if ~exist('rxObj', 'var')
+    error('Run initialize_rx.m first.');
+end
 
 % Adjust to match RX position
-x_lab = 0;
-y_lab = 0;
-orientation = 0;
+x_lab = 6; % 0 to 15
+y_lab = 11; % 0 to 11
+orientation = 135; % 0, 45, 90, 135
 
 disp(string(x_lab) + " " + string(y_lab) + " " + string(orientation));
 
 % Adjust to match TX position, ALSO UPDATE THE FILENAME TO TX#
 
 % tx_num = 1;
-% tx_pos = [-1, 10, 0.875];
+% tx_pos = [11, 15, 0];
 
-tx_num = 2;
-tx_pos = [13, 8, 0.875];
+% tx_num = 2;
+% tx_pos = [1, 8, 0];
 
-%tx_num = 3;
-%tx_pos = [6, 5, 1.021];
+tx_num = 3;
+tx_pos = [8, 5, 0];
 
 if x_lab == round(x_lab) && y_lab == round(y_lab)
-    data_folder = "mimo_data/";
+    data_folder = "data_f2/";
 elseif x_lab == round(x_lab) || y_lab == round(y_lab)
     disp("Something is mismatched check x y")
 else
-    data_folder = "mimo_test_data/";
+    data_folder = "test_data_f2/";
 end
-
 
 %% -------------------------------------------------------------------------
 % CONFIGURATION
 % -------------------------------------------------------------------------
-Fs          = 500e3;
+Fs          = 1e6;
 CaptureTime = 2;           % seconds
 TotalSamples = round(Fs * CaptureTime);
 
-%% -------------------------------------------------------------------------
-% SDR CONFIGURATION  %5.4e9
-% -------------------------------------------------------------------------
-rxObj = comm.SDRuReceiver( ...
-    'Platform',          'B210', ...
-    'SerialNum',         '34C78FD', ...
-    'MasterClockRate',   30e6, ...
-    'DecimationFactor',  60, ...
-    'SamplesPerFrame',   TotalSamples, ...
-    'CenterFrequency',   915e6, ...
-    'ChannelMapping',    [1 2], ...    
-    'Gain',              [40 40], ...
-    'OutputDataType',    'double');
+% Change decimation factor -> change Fs
+% masterclockrate/decimationfactor = sampleperframe
 
 %% -------------------------------------------------------------------------
 % CAPTURE
@@ -70,16 +63,16 @@ disp('Capture complete. Saving raw IQ buffer...');
 raw_data.iq          = rxBuffer;        % [TotalSamples x 2] complex double
 raw_data.Fs          = Fs;
 raw_data.CaptureTime = CaptureTime;
-raw_data.freq        = 915e6;
+raw_data.freq        = 5.4e9;
 raw_data.rx_pos      = [x_lab, y_lab, 0.571];
 raw_data.tx_pos      = tx_pos;
 raw_data.mimo        = false;
 raw_data.rx_orient   = orientation;
     
 if x_lab >= 0
-    filename = data_folder + 'mimo_tx' + string(tx_num) + '_' + string(x_lab) + '_' + string(y_lab) + '_' + string(orientation) + '.mat';
+    filename = data_folder + 'beam_tx' + string(tx_num) + '_' + string(x_lab) + '_' + string(y_lab) + '_' + string(orientation) + '.mat';
 else
-    filename = data_folder + 'mimo_tx' + string(tx_num) + '_n1_' + string(y_lab) + '_' + string(orientation) + '.mat';
+    filename = data_folder + 'beam_tx' + string(tx_num) + '_n1_' + string(y_lab) + '_' + string(orientation) + '.mat';
 end
 
 % if you f-up a file then just uncomment this and ignore the error
@@ -95,4 +88,6 @@ else
     error("duplicate file name")
 end
 
-release(rxObj);
+%% MUST RELEASE RX IN CLI AFTER
+% release(rxObj);
+% clear rxObj;

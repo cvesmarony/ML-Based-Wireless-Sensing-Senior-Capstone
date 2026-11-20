@@ -1,24 +1,10 @@
-clear all;
-%% ==============================================================================
-% NeRF2 TRANSMITTER - MIMO MODE (turn-taking antennas)
-% ==============================================================================
-%% MIMO CONFIGURATION
-mimo_config = struct();
-mimo_config.fc = 915e6; % Center frequency (Hz)
+%% 1. CHECK TX INITIALIZATION
+
+if ~exist('tx', 'var')
+    error('Run initialize_tx.m first.');
+end
+
 sps = 5;
-
-%% 1. HARDWARE CONFIG
-tx = comm.SDRuTransmitter(...
-    'Platform', 'B210', ...
-    'SerialNum', '34C78EF', ...
-    'ChannelMapping', [1 2], ...
-    'MasterClockRate', 30e6, ...
-    'InterpolationFactor', 60, ...
-    'CenterFrequency', mimo_config.fc, ...
-    'Gain', [60 60], ...
-    'TransportDataType', 'int16');
-
-Fs = 30e6 / 60; % 3 Msps
 
 %% 2. SIGNAL GENERATION - STREAM S
 
