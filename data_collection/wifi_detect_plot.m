@@ -14,19 +14,19 @@ clear;
 % Leave sourceFile empty to capture live, or set it to a file saved by
 % wifi_capture_raw.m (e.g. 'wifi_raw/raw_ch6_0_0_0_20261110_163914.mat') to
 % analyse that capture; the radio settings below are then read from the file.
-sourceFile  = '';
+sourceFile  = 'wifi_raw/passive2_06_11_000_20261120_150311.mat';
 captureMs   = 100;              % how long to listen (ms)
 % B210 sample rate (= MasterClockRate, no decimation). At 20 MS/s the
 % Nyquist edges sit exactly on the 20 MHz channel edges, so nothing outside
 % the channel is visible. A higher rate (e.g. 25e6, or up to 30.72e6 with 2
 % antennas) shows the band edges and the receive filter roll-off. The
 % decoder always runs at 20 MS/s; other rates are resampled for decoding.
-sampleRate  = 11e6;
-TotalSamples = round(sampleRate * captureMs*1000)
+sampleRate  = 10e6; 
+TotalSamples = round(sampleRate * captureMs/1000)
 channel     = 6;
 centerFreq  = 2407e6 + 5e6 * channel;
-rxGain      = 25;               % dB, same on all channels
-sdrSerial   = '3839244';        % check with "findsdru"
+rxGain      = 40;               % dB, same on all channels
+sdrSerial   = '3839223';        % check with "findsdru"
 antennaPort = 'RX2';
 numRx       = 2;
 

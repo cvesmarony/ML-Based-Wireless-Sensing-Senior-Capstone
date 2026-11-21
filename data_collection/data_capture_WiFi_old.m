@@ -10,13 +10,13 @@ data_folder  = 'wifi_data/';
 saveFullCapture = false;        % also save the whole raw buffer (~16 MB per 100 ms)
 
 %% Configuration
-sampleRate   = 20e6;
-CaptureTime  = 0.01;                        % 100 ms burst capture
+sampleRate   = 22e6;
+CaptureTime  = 0.1;                        % 100 ms burst capture
 TotalSamples = round(sampleRate * CaptureTime);
 channel      = 6;
 centerFreq   = 2407e6 + 5e6 * channel;
-rxGain       = 76;
-sdrSerial    = '3839244';                  % check with "findsdru"
+rxGain       = 40;
+sdrSerial    = '3839223';                  % check with "findsdru"
 antennaPort  = 'RX2';
 
 % Packets below minSnrDb are dropped before decoding (even the 6 Mb/s L-SIG
