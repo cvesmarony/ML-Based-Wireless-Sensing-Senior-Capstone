@@ -1,7 +1,7 @@
 clear;
 
 % Adjust to match RX position
-x_lab = 6; % 0 to 15
+x_lab = 12; % 0 to 15
 y_lab = 11; % 0 to 11
 orientation = 135; % 0, 45, 90, 135
 

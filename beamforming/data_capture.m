@@ -6,22 +6,22 @@ if ~exist('rxObj', 'var')
 end
 
 % Adjust to match RX position
-x_lab = 6; % 0 to 15
+x_lab = 7; % 0 to 15
 y_lab = 11; % 0 to 11
-orientation = 135; % 0, 45, 90, 135
+orientation = 0; % 0, 45, 90, 135
 
 disp(string(x_lab) + " " + string(y_lab) + " " + string(orientation));
 
 % Adjust to match TX position, ALSO UPDATE THE FILENAME TO TX#
 
-% tx_num = 1;
-% tx_pos = [11, 15, 0];
+tx_num = 1;
+tx_pos = [11, 15, 0];
 
 % tx_num = 2;
 % tx_pos = [1, 8, 0];
 
-tx_num = 3;
-tx_pos = [8, 5, 0];
+% tx_num = 3;
+% tx_pos = [8, 5, 0];
 
 if x_lab == round(x_lab) && y_lab == round(y_lab)
     data_folder = "data_f2/";
@@ -46,8 +46,13 @@ TotalSamples = round(Fs * CaptureTime);
 % -------------------------------------------------------------------------
 disp(['Capturing ', num2str(CaptureTime), ' seconds of data...']);
 
-[rxBuffer, ~, overrun] = rxObj();
+% [rxBuffer, ~, overrun] = rxObj();
 
+[rxBuffer, len, overrun] = rxObj();
+
+disp(['Samples returned: ', num2str(len)]);
+disp(['Buffer size: ', num2str(size(rxBuffer,1))]);
+disp(['Overrun: ', num2str(overrun)]);
 if overrun
     warning('Overrun detected during capture.');
 end
